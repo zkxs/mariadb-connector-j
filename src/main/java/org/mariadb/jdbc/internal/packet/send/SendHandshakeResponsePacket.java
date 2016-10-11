@@ -49,8 +49,10 @@ OF SUCH DAMAGE.
 
 package org.mariadb.jdbc.internal.packet.send;
 
+import org.mariadb.jdbc.MariaDbConnection;
 import org.mariadb.jdbc.MariaDbDatabaseMetaData;
 import org.mariadb.jdbc.internal.MariaDbServerCapabilities;
+import org.mariadb.jdbc.internal.packet.Packet;
 import org.mariadb.jdbc.internal.protocol.authentication.DefaultAuthenticationProvider;
 import org.mariadb.jdbc.internal.util.PidFactory;
 import org.mariadb.jdbc.internal.util.Utils;
@@ -60,6 +62,7 @@ import org.mariadb.jdbc.internal.util.constant.Version;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.StringTokenizer;
@@ -87,19 +90,29 @@ import java.util.StringTokenizer;
  * databasename:            name of schema to use initially
  */
 public class SendHandshakeResponsePacket implements InterfaceSendPacket {
+
+    private static final byte[] VARIABLES_CMD = ("SHOW VARIABLES WHERE Variable_name in ("
+            + "'max_allowed_packet', "
+            + "'system_time_zone', "
+            + "'time_zone', "
+            + "'sql_mode'"
+            + ")").getBytes(StandardCharsets.UTF_8);
+    private static final byte[] AUTOCOMMIT_CMD = "set session autocommit=1".getBytes(StandardCharsets.UTF_8);
+
     private byte packetSeq;
     private String username;
     private String password;
     private byte[] seed;
     private long clientCapabilities;
+    private long serverCapabilities;
     private final byte serverLanguage;
     private String database;
     private String plugin;
     private String connectionAttributes;
-    private long serverThreadId;
 
     private byte[] connectionAttributesArray;
     private int connectionAttributesPosition;
+    private boolean createDatabaseIfNotExist;
 
     /**
      * Initialisation of parameters.
@@ -107,33 +120,36 @@ public class SendHandshakeResponsePacket implements InterfaceSendPacket {
      * @param password user password
      * @param database initial database connection
      * @param clientCapabilities capabilities
+     * @param serverCapabilities serverCapabilities
      * @param serverLanguage serverlanguage
      * @param seed seed
      * @param packetSeq stream sequence
      * @param plugin authentication plugin name
      * @param connectionAttributes connection attributes option
-     * @param serverThreadId threadId;
+     * @param createDatabaseIfNotExist createDatabaseIfNotExist
      */
     public SendHandshakeResponsePacket(final String username,
                                        final String password,
                                        final String database,
                                        final long clientCapabilities,
+                                       final long serverCapabilities,
                                        final byte serverLanguage,
                                        final byte[] seed,
                                        byte packetSeq,
                                        String plugin,
                                        String connectionAttributes,
-                                       long serverThreadId) {
+                                       boolean createDatabaseIfNotExist) {
         this.packetSeq = packetSeq;
         this.username = username;
         this.password = password;
         this.seed = seed;
         this.clientCapabilities = clientCapabilities;
+        this.serverCapabilities = serverCapabilities;
         this.serverLanguage = serverLanguage;
         this.database = database;
         this.plugin = plugin;
         this.connectionAttributes = connectionAttributes;
-        this.serverThreadId = serverThreadId;
+        this.createDatabaseIfNotExist = createDatabaseIfNotExist;
     }
 
     /**
@@ -173,29 +189,81 @@ public class SendHandshakeResponsePacket implements InterfaceSendPacket {
         writeBuffer.writeString(username)     //strlen username
                 .writeByte((byte) 0);        //1
 
-        if ((clientCapabilities & MariaDbServerCapabilities.PLUGIN_AUTH_LENENC_CLIENT_DATA) != 0) {
+        if ((serverCapabilities & MariaDbServerCapabilities.PLUGIN_AUTH_LENENC_CLIENT_DATA) != 0) {
             writeBuffer.writeFieldLength(authData.length)
                     .writeByteArray(authData);
-        } else if ((clientCapabilities & MariaDbServerCapabilities.SECURE_CONNECTION) != 0) {
+        } else if ((serverCapabilities & MariaDbServerCapabilities.SECURE_CONNECTION) != 0) {
             writeBuffer.writeByte((byte) authData.length)
                     .writeByteArray(authData);
         } else {
             writeBuffer.writeByteArray(authData).writeByte((byte) 0);
         }
 
-        if ((clientCapabilities & MariaDbServerCapabilities.CONNECT_WITH_DB) != 0) {
+        if ((serverCapabilities & MariaDbServerCapabilities.CONNECT_WITH_DB) != 0) {
             writeBuffer.writeString(database).writeByte((byte) 0);
         }
 
-        if ((clientCapabilities & MariaDbServerCapabilities.PLUGIN_AUTH) != 0) {
+        if ((serverCapabilities & MariaDbServerCapabilities.PLUGIN_AUTH) != 0) {
             writeBuffer.writeString(plugin).writeByte((byte) 0);
         }
 
-        if ((clientCapabilities & MariaDbServerCapabilities.CONNECT_ATTRS) != 0) {
+        if ((serverCapabilities & MariaDbServerCapabilities.CONNECT_ATTRS) != 0) {
             writeConnectAttributes(writeBuffer);
         }
+
+        if ((serverCapabilities & MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH) != 0) {
+            writeAdditionalQueries(writeBuffer);
+        }
+
+
         writeBuffer.finishPacketWithoutRelease(false);
         writeBuffer.releaseBuffer();
+
+    }
+
+    private void writeAdditionalQueries(PacketOutputStream writer) {
+
+        //reservation for command length
+        final int initialPosition = writer.buffer.position();
+        writer.assureBufferCapacity(9);
+        writer.buffer.put((byte) 0xfe);
+        writer.buffer.putLong(0L);
+
+        writer.buffer.put(Packet.COM_MULTI);
+
+        //send variables command
+        writer.writeFieldLength(VARIABLES_CMD.length + 1);
+        writer.buffer.put(Packet.COM_QUERY);
+        writer.buffer.put(VARIABLES_CMD);
+
+        //send autocommit command
+        writer.writeFieldLength(AUTOCOMMIT_CMD.length + 1);
+        writer.buffer.put(Packet.COM_QUERY);
+        writer.buffer.put(AUTOCOMMIT_CMD);
+
+        if (this.createDatabaseIfNotExist) {
+            // Try to create the database if it does not exist
+            String quotedDb = MariaDbConnection.quoteIdentifier(this.database);
+            byte[] createDbCmd = ("CREATE DATABASE IF NOT EXISTS " + quotedDb).getBytes(StandardCharsets.UTF_8);
+            byte[] useDbCmd = ("USE " + quotedDb).getBytes(StandardCharsets.UTF_8);
+
+            writer.writeFieldLength(createDbCmd.length + 1);
+
+            writer.buffer.put(Packet.COM_QUERY);
+            writer.buffer.put(createDbCmd);
+
+            writer.writeFieldLength(useDbCmd.length + 1);
+
+            writer.buffer.put(Packet.COM_QUERY);
+            writer.buffer.put(useDbCmd);
+        }
+
+        //set real length
+        int endPosition = writer.buffer.position();
+        long commandLength = endPosition - (initialPosition + 9);
+        writer.buffer.position(initialPosition + 1);
+        writer.buffer.putLong(commandLength);
+        writer.buffer.position(endPosition);
 
     }
 

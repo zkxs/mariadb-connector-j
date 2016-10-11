@@ -68,4 +68,5 @@ public class Packet {
     public static final byte COM_STMT_EXECUTE = (byte) 0x17;
     public static final byte COM_STMT_SEND_LONG_DATA = (byte) 0x18;
     public static final byte COM_STMT_CLOSE = (byte) 0x19;
+    public static final byte COM_MULTI = (byte) 0xfe;
 }

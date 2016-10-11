@@ -63,6 +63,7 @@ import org.mariadb.jdbc.internal.logging.LoggerFactory;
 import org.mariadb.jdbc.internal.packet.send.*;
 import org.mariadb.jdbc.internal.protocol.authentication.AuthenticationProviderHolder;
 import org.mariadb.jdbc.internal.queryresults.ExecutionResult;
+import org.mariadb.jdbc.internal.queryresults.MultiVariableIntExecutionResult;
 import org.mariadb.jdbc.internal.queryresults.SingleExecutionResult;
 import org.mariadb.jdbc.internal.queryresults.resultset.MariaSelectResultSet;
 import org.mariadb.jdbc.internal.stream.MariaDbBufferedInputStream;
@@ -373,19 +374,8 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
         handleConnectionPhases();
 
-        if (options.useCompression) {
-            writer.setUseCompression(true);
-            packetFetcher = new ReadPacketFetcher(new DecompressInputStream(socket.getInputStream()), options.maxQuerySizeToLog);
-        }
-        connected = true;
-
-        writer.forceCleanupBuffer();
-
-        loadServerData();
-        setSessionOptions();
         writer.setMaxAllowedPacket(Integer.parseInt(serverData.get("max_allowed_packet")));
 
-        createDatabaseIfNotExist();
         loadCalendar();
 
 
@@ -404,28 +394,6 @@ public abstract class AbstractConnectProtocol implements Protocol {
         return !this.connected;
     }
 
-    private void setSessionOptions()  throws QueryException {
-        // In JDBC, connection must start in autocommit mode
-        // [CONJ-269] we cannot rely on serverStatus & ServerStatus.AUTOCOMMIT before this command to avoid this command.
-        // if autocommit=0 is set on server configuration, DB always send Autocommit on serverStatus flag
-        // after setting autocommit, we can rely on serverStatus value
-        String sessionOption = "autocommit=1";
-
-        if (options.jdbcCompliantTruncation) {
-            if (serverData.get("sql_mode") == null || "".equals(serverData.get("sql_mode"))) {
-                sessionOption += ",sql_mode='STRICT_TRANS_TABLES'";
-            } else {
-                if (!serverData.get("sql_mode").contains("STRICT_TRANS_TABLES")) {
-                    sessionOption += ",sql_mode='" + serverData.get("sql_mode") + ",STRICT_TRANS_TABLES'";
-                }
-            }
-        }
-        if (options.sessionVariables != null) {
-            sessionOption += "," + options.sessionVariables;
-        }
-        executeQuery("set session " + sessionOption);
-    }
-
     private void handleConnectionPhases() throws QueryException {
         MariaDbInputStream reader = null;
         try {
@@ -438,7 +406,6 @@ public abstract class AbstractConnectProtocol implements Protocol {
             this.serverThreadId = greetingPacket.getServerThreadId();
             this.version = greetingPacket.getServerVersion();
             this.checkCallableResultSet = this.version.indexOf("MariaDB") == -1;
-
             byte exchangeCharset = decideLanguage(greetingPacket.getServerLanguage());
             parseVersion();
             long clientCapabilities = initializeClientCapabilities();
@@ -472,6 +439,20 @@ public abstract class AbstractConnectProtocol implements Protocol {
             authentication(exchangeCharset, clientCapabilities, greetingPacket.getSeed(), packetSeq,
                     greetingPacket.getPluginName(), greetingPacket.getServerCapabilities());
 
+            if (options.useCompression) {
+                writer.setUseCompression(true);
+                packetFetcher = new ReadPacketFetcher(new DecompressInputStream(socket.getInputStream()), options.maxQuerySizeToLog);
+            }
+            connected = true;
+
+            writer.forceCleanupBuffer();
+
+            if ((greetingPacket.getServerCapabilities() & MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH) != 0) {
+                forceStrictModeIfNeeded();
+            } else {
+                loadAdditionalNeededData();
+            }
+
         } catch (IOException e) {
             if (reader != null) {
                 try {
@@ -483,6 +464,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
             throw new QueryException("Could not connect to " + currentHost.host + ":" + currentHost.port + ": " + e.getMessage(), -1,
                     CONNECTION_EXCEPTION, e);
         }
+
     }
 
     private void authentication(byte exchangeCharset, long clientCapabilities, byte[] seed, byte packetSeq, String plugin, long serverCapabilities)
@@ -491,14 +473,16 @@ public abstract class AbstractConnectProtocol implements Protocol {
                 this.password,
                 database,
                 clientCapabilities,
+                serverCapabilities,
                 exchangeCharset,
                 seed,
                 packetSeq,
                 plugin,
                 options.connectionAttributes,
-                serverThreadId);
+                options.createDatabaseIfNotExist);
         cap.send(writer);
         Buffer buffer = packetFetcher.getPacket();
+        getMariaDbComMultiAuthDatas(serverCapabilities);
 
         if ((buffer.getByteAt(0) & 0xFF) == 0xFE) {
             InterfaceAuthSwitchSendResponsePacket interfaceSendPacket;
@@ -528,6 +512,30 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
     }
 
+    /**
+     * Retrieve auth query results.
+     * @param serverCapabilities serverCapabilities
+     */
+    private void getMariaDbComMultiAuthDatas(long serverCapabilities) throws QueryException {
+        if ((serverCapabilities & MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH) != 0) {
+            try {
+
+                MultiVariableIntExecutionResult qr = new MultiVariableIntExecutionResult(null, 5, 0, true);
+                getResult(qr, ResultSet.TYPE_FORWARD_ONLY, false, true);
+
+                serverData = new TreeMap<>();
+                MariaSelectResultSet resultSet = qr.getResultSet();
+                while (resultSet.next()) {
+                    logger.debug("server data " + resultSet.getString(1) + " : " + resultSet.getString(2));
+                    serverData.put(resultSet.getString(1), resultSet.getString(2));
+                }
+
+            } catch (SQLException sqle) {
+                throw new QueryException("could not load system variables", -1, CONNECTION_EXCEPTION, sqle);
+            }
+        }
+    }
+
     private long initializeClientCapabilities() {
         long capabilities =
                 //MariaDbServerCapabilities.CLIENT_MYSQL
@@ -542,7 +550,8 @@ public abstract class AbstractConnectProtocol implements Protocol {
                         | MariaDbServerCapabilities.PLUGIN_AUTH
                         | MariaDbServerCapabilities.CONNECT_ATTRS
                         | MariaDbServerCapabilities.PLUGIN_AUTH_LENENC_CLIENT_DATA
-                        | MariaDbServerCapabilities.MARIADB_CLIENT_COM_MULTI;
+                        | MariaDbServerCapabilities.MARIADB_CLIENT_COM_MULTI
+                        | MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH;
 
         if (options.allowMultiQueries || (options.rewriteBatchedStatements)) {
             capabilities |= MariaDbServerCapabilities.MULTI_STATEMENTS;
@@ -614,7 +623,20 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
     }
 
-    private void loadServerData() throws QueryException, IOException {
+    private void forceStrictModeIfNeeded() throws QueryException, IOException {
+        if (options.jdbcCompliantTruncation) {
+            String sqlMode = serverData.get("sql_mode");
+            if (sqlMode == null || "".equals(sqlMode)) {
+                executeQuery("set session sql_mode='STRICT_TRANS_TABLES'");
+            } else if (!sqlMode.contains("STRICT_TRANS_TABLES")
+                    && !sqlMode.contains("STRICT_ALL_TABLES")
+                    && !sqlMode.contains("TRADITIONAL")) {
+                executeQuery("set session sql_mode='" + serverData.get("sql_mode") + ",STRICT_TRANS_TABLES'");
+            }
+        }
+    }
+
+    private void loadAdditionalNeededData() throws QueryException, IOException {
         serverData = new TreeMap<>();
         SingleExecutionResult qr = new SingleExecutionResult(null, 0, true, false);
         try {
@@ -632,6 +654,28 @@ public abstract class AbstractConnectProtocol implements Protocol {
         } catch (SQLException sqle) {
             throw new QueryException("could not load system variables", -1, CONNECTION_EXCEPTION, sqle);
         }
+
+        // In JDBC, connection must start in autocommit mode
+        // [CONJ-269] we cannot rely on serverStatus & ServerStatus.AUTOCOMMIT before this command to avoid this command.
+        // if autocommit=0 is set on server configuration, DB always send Autocommit on serverStatus flag
+        // after setting autocommit, we can rely on serverStatus value
+        String sessionOption = "autocommit=1";
+
+        if (options.jdbcCompliantTruncation) {
+            if (serverData.get("sql_mode") == null || "".equals(serverData.get("sql_mode"))) {
+                sessionOption += ",sql_mode='STRICT_TRANS_TABLES'";
+            } else {
+                if (!serverData.get("sql_mode").contains("STRICT_TRANS_TABLES")) {
+                    sessionOption += ",sql_mode='" + serverData.get("sql_mode") + ",STRICT_TRANS_TABLES'";
+                }
+            }
+        }
+        if (options.sessionVariables != null) {
+            sessionOption += "," + options.sessionVariables;
+        }
+        executeQuery("set session " + sessionOption);
+        createDatabaseIfNotExist();
+
     }
 
     public String getServerData(String code) {
