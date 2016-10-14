@@ -53,8 +53,6 @@ package org.mariadb.jdbc.internal.queryresults.resultset;
 
 import org.mariadb.jdbc.*;
 import org.mariadb.jdbc.internal.MariaDbType;
-import org.mariadb.jdbc.internal.logging.Logger;
-import org.mariadb.jdbc.internal.logging.LoggerFactory;
 import org.mariadb.jdbc.internal.packet.dao.ColumnInformation;
 import org.mariadb.jdbc.internal.packet.Packet;
 import org.mariadb.jdbc.internal.packet.read.ReadPacketFetcher;
@@ -88,7 +86,7 @@ import static org.mariadb.jdbc.internal.util.SqlStates.CONNECTION_EXCEPTION;
 
 @SuppressWarnings("deprecation")
 public class MariaSelectResultSet implements ResultSet {
-    private static Logger logger = LoggerFactory.getLogger(MariaSelectResultSet.class);
+
     public static final MariaSelectResultSet EMPTY = createEmptyResultSet();
 
     public static final int TINYINT1_IS_BIT = 1;
@@ -97,26 +95,29 @@ public class MariaSelectResultSet implements ResultSet {
 
     private Protocol protocol;
     private ReadPacketFetcher packetFetcher;
-    private MariaDbInputStream inputStream;
 
     private Statement statement;
     private RowPacket rowPacket;
     private ColumnInformation[] columnsInformation;
 
-    private byte[] lastReusableArray = null;
     private boolean isEof;
     private boolean isBinaryEncoded;
     private int dataFetchTime;
     private boolean streaming;
     private int columnInformationLength;
-    private List<byte[][]> resultSet;
+    private byte[][] resultSet;
     private int resultSetSize;
     private int fetchSize;
     private int resultSetScrollType;
+
+    //reading variables
     private int rowPointer;
+    private int lastReadFetchTime;
+    private int lastRowPointer;
+
     private ColumnNameMap columnNameMap;
     private Calendar cal;
-    private boolean lastGetWasNull;
+    private RowStore lastRowStore;
     private int dataTypeMappingFlags;
     private Options options;
     private boolean returnTableAlias;
@@ -161,12 +162,15 @@ public class MariaSelectResultSet implements ResultSet {
 
         this.columnInformationLength = columnInformation.length;
         this.packetFetcher = fetcher;
-        this.inputStream = packetFetcher.getInputStream();
         this.isEof = false;
         this.isBinaryEncoded = isBinaryEncoded;
         this.fetchSize = fetchSize;
         this.resultSetScrollType = resultSetScrollType;
-        this.resultSet = new ArrayList<>();
+        if (fetchSize > 0) {
+            this.resultSet = new byte[fetchSize][];
+        } else {
+            this.resultSet = new byte[16][];
+        }
         this.resultSetSize = 0;
         this.dataFetchTime = 0;
         this.rowPointer = -1;
@@ -182,7 +186,7 @@ public class MariaSelectResultSet implements ResultSet {
      * @param resultSetScrollType one of the following <code>ResultSet</code> constants: <code>ResultSet.TYPE_FORWARD_ONLY</code>,
      *                            <code>ResultSet.TYPE_SCROLL_INSENSITIVE</code>, or <code>ResultSet.TYPE_SCROLL_SENSITIVE</code>
      */
-    public MariaSelectResultSet(ColumnInformation[] columnInformation, List<byte[][]> resultSet, Protocol protocol,
+    public MariaSelectResultSet(ColumnInformation[] columnInformation, byte[][] resultSet, Protocol protocol,
                                 int resultSetScrollType) {
         this.statement = null;
         this.isClosed = false;
@@ -201,12 +205,13 @@ public class MariaSelectResultSet implements ResultSet {
         this.columnsInformation = columnInformation;
         this.columnNameMap = new ColumnNameMap(columnsInformation);
         this.columnInformationLength = columnInformation.length;
+        this.rowPacket = new TextRowPacket(columnInformationLength);
         this.isEof = false;
         this.isBinaryEncoded = false;
         this.fetchSize = 1;
         this.resultSetScrollType = resultSetScrollType;
         this.resultSet = resultSet;
-        this.resultSetSize = this.resultSet.size();
+        this.resultSetSize = this.resultSet.length;
         this.dataFetchTime = 0;
         this.rowPointer = -1;
         this.callableResult = false;
@@ -227,14 +232,52 @@ public class MariaSelectResultSet implements ResultSet {
         ColumnInformation[] columns = new ColumnInformation[1];
         columns[0] = ColumnInformation.create("insert_id", MariaDbType.BIGINT);
 
-        List<byte[][]> rows = new ArrayList<>();
-        for (long rowData : data) {
-            if (rowData != 0) {
-                byte[][] row = new byte[1][];
-                row[0] = String.valueOf(rowData).getBytes();
-                rows.add(row);
+        byte[][] rows = new byte[data.length][];
+        int rowNumber = 0;
+        for (int i = 0; i < data.length; i++) {
+            if (data[i] != 0) {
+                String stringValue = String.valueOf(data[i]);
+                int length = stringValue.length();
+                byte[] row;
+                if (length < 251) {
+                    row = new byte[length + 1];
+                    row[0] = (byte) length;
+                    System.arraycopy(stringValue.getBytes(), 0, row, 1, length);
+                } else if (length < 65536) {
+                    row = new byte[length + 3];
+                    row[0] = (byte) 0xfc;
+                    row[1] = (byte) (length & 0xff);
+                    row[2] = (byte) (length >>> 8);
+                    System.arraycopy(stringValue.getBytes(), 0, row, 3, length);
+
+                } else if (length < 16777216) {
+                    row = new byte[length + 4];
+                    row[0] = (byte) 0xfd;
+                    row[1] = (byte) (length & 0xff);
+                    row[2] = (byte) (length >>> 8);
+                    row[3] = (byte) (length >>> 16);
+                    System.arraycopy(stringValue.getBytes(), 0, row, 4, length);
+                } else {
+                    row = new byte[length + 9];
+                    row[0] = (byte) 0xfe;
+                    row[1] = (byte) (length & 0xff);
+                    row[2] = (byte) (length >>> 8);
+                    row[3] = (byte) (length >>> 16);
+                    row[4] = (byte) (length >>> 24);
+                    row[5] = (byte) (length >>> 32);
+                    row[6] = (byte) (length >>> 40);
+                    row[7] = (byte) (length >>> 48);
+                    row[8] = (byte) (length >>> 56);
+                    System.arraycopy(stringValue.getBytes(), 0, row, 9, length);
+                }
+                rows[rowNumber++] = row;
             }
         }
+
+        if (rowNumber < data.length) {
+            rows = Arrays.copyOf(rows, rowNumber);
+        }
+
         if (findColumnReturnsOne) {
             return new MariaSelectResultSet(columns, rows, protocol, TYPE_SCROLL_SENSITIVE) {
                 @Override
@@ -242,6 +285,7 @@ public class MariaSelectResultSet implements ResultSet {
                     return 1;
                 }
             };
+
         }
         return new MariaSelectResultSet(columns, rows, protocol, TYPE_SCROLL_SENSITIVE);
     }
@@ -267,38 +311,78 @@ public class MariaSelectResultSet implements ResultSet {
             columns[i] = ColumnInformation.create(columnNames[i], columnTypes[i]);
         }
 
-        final byte[] boolTrue = {1};
-        final byte[] boolFalse = {0};
-        List<byte[][]> rows = new ArrayList<>();
-        for (String[] rowData : data) {
-            byte[][] row = new byte[columnNameLength][];
+        byte[][] rows = new byte[data.length][];
+        for (int rowIndex = 0; rowIndex < data.length; rowIndex++) {
+            String[] rowData = data[rowIndex];
+            byte[] row = new byte[1024];
+            int offset = 0;
 
             if (rowData.length != columnNameLength) {
                 throw new RuntimeException("Number of elements in the row != number of columns :" + rowData.length + " vs " + columnNameLength);
             }
+
             for (int i = 0; i < columnNameLength; i++) {
-                byte[] bytes;
-                if (rowData[i] == null) {
-                    bytes = null;
+                String stringValue = rowData[i];
+                if (stringValue == null) {
+                    row = ensureCapacity(row, offset, 1);
+                    row[offset++] = (byte) 251;
                 } else if (columnTypes[i] == MariaDbType.BIT) {
-                    bytes = rowData[i].equals("0") ? boolFalse : boolTrue;
+                    row = ensureCapacity(row, offset, 2);
+                    row[offset++] = (byte) 1;
+                    row[offset++] = (byte) (stringValue.equals("0") ? 0 : 1);
                 } else {
                     try {
-                        bytes = rowData[i].getBytes("UTF-8");
+                        byte[] bytes = stringValue.getBytes("UTF-8");
+                        int length = bytes.length;
+                        if (length < 251) {
+                            row = ensureCapacity(row, offset, length + 1);
+                            row[offset++] = (byte) length;
+                        } else if (length < 65536) {
+                            row = ensureCapacity(row, offset, length + 3);
+                            row[offset++] = (byte) 0xfc;
+                            row[offset++] = (byte) (length & 0xff);
+                            row[offset++] = (byte) (length >>> 8);
+                        } else if (length < 16777216) {
+                            row = ensureCapacity(row, offset, length + 4);
+                            row[offset++] = (byte) 0xfd;
+                            row[offset++] = (byte) (length & 0xff);
+                            row[offset++] = (byte) (length >>> 8);
+                            row[offset++] = (byte) (length >>> 16);
+                        } else {
+                            row = ensureCapacity(row, offset, length + 9);
+                            row[offset++] = (byte) 0xfe;
+                            row[offset++] = (byte) (length & 0xff);
+                            row[offset++] = (byte) (length >>> 8);
+                            row[offset++] = (byte) (length >>> 16);
+                            row[offset++] = (byte) (length >>> 24);
+                            row[offset++] = (byte) (length >>> 32);
+                            row[offset++] = (byte) (length >>> 40);
+                            row[offset++] = (byte) (length >>> 48);
+                            row[offset++] = (byte) (length >>> 56);
+                        }
+                        System.arraycopy(bytes, 0, row, offset, length);
+                        offset += length;
                     } catch (UnsupportedEncodingException e) {
                         //never append, UTF-8 is known
-                        bytes = new byte[0];
                     }
                 }
-                row[i] = bytes;
             }
-            rows.add(row);
+            rows[rowIndex] = row;
         }
         return new MariaSelectResultSet(columns, rows, protocol, TYPE_SCROLL_SENSITIVE);
     }
 
+    private static byte[] ensureCapacity(byte[] arr, int offset, int length) {
+        if (length > arr.length - offset) {
+            byte[] newArr = new byte[Math.max(arr.length + length, arr.length * 2)];
+            System.arraycopy(arr, 0, newArr, 0, offset);
+            return arr;
+        }
+        return arr;
+    }
+
     private static MariaSelectResultSet createEmptyResultSet() {
-        return new MariaSelectResultSet(new ColumnInformation[0], new ArrayList<byte[][]>(), null,
+        return new MariaSelectResultSet(new ColumnInformation[0], new byte[0][0], null,
                 TYPE_SCROLL_SENSITIVE);
     }
 
@@ -330,13 +414,12 @@ public class MariaSelectResultSet implements ResultSet {
 
     private void fetchAllResults() throws IOException, QueryException {
 
-        final List<byte[][]> valueObjects = new ArrayList<>();
-        while (readNextValue(valueObjects)) {
-            //fetch all results
+        int loaded = 0;
+        while (readNextValue(loaded)) {
+            loaded++;
         }
         dataFetchTime++;
-        resultSet = valueObjects;
-        this.resultSetSize = resultSet.size();
+        this.resultSetSize = loaded;
     }
 
     /**
@@ -347,11 +430,13 @@ public class MariaSelectResultSet implements ResultSet {
     public void fetchAllStreaming() throws SQLException {
         try {
             try {
-                Protocol protocolTmp = this.protocol;
-                while (readNextValue(resultSet)) {
-                    //fetch all results
+                final Protocol protocolTmp = this.protocol;
+                int loaded = this.resultSetSize;
+                while (readNextValue(loaded)) {
+                    loaded++;
                 }
-                resultSetSize = resultSet.size();
+                dataFetchTime++;
+                this.resultSetSize = loaded;
 
                 //retrieve other results if needed
                 if (protocolTmp.hasMoreResults()) {
@@ -360,7 +445,7 @@ public class MariaSelectResultSet implements ResultSet {
                     }
                 }
             } catch (IOException ioexception) {
-                throw new QueryException("Could not close resultset : " + ioexception.getMessage(), -1, CONNECTION_EXCEPTION, ioexception);
+                throw new QueryException("Could not close resultSet : " + ioexception.getMessage(), -1, CONNECTION_EXCEPTION, ioexception);
             }
         } catch (QueryException queryException) {
             ExceptionMapper.throwException(queryException, null, this.getStatement());
@@ -372,103 +457,54 @@ public class MariaSelectResultSet implements ResultSet {
 
     private void nextStreamingValue() throws IOException, QueryException {
 
-        final List<byte[][]> valueObjects = new ArrayList<>(fetchSize);
         //fetch maximum fetchSize results
-        int fetchSizeTmp = fetchSize;
-        while (fetchSizeTmp > 0 && readNextValue(valueObjects)) {
-            fetchSizeTmp--;
+        int loaded = 0;
+        if (fetchSize > resultSet.length) resultSet = new byte[fetchSize][];
+        while (loaded < fetchSize && readNextValue(loaded)) {
+            loaded++;
         }
         dataFetchTime++;
-        resultSet = valueObjects;
-        this.resultSetSize = resultSet.size();
+        this.resultSetSize = loaded;
     }
 
-    /**
-     * Read next value.
-     *
-     * @param values values
-     * @return true if have a new value
-     * @throws IOException    exception
-     * @throws QueryException exception
-     */
-    public boolean readNextValue(List<byte[][]> values) throws IOException, QueryException {
-        int length = inputStream.readHeader();
-        if (length < 0x00ffffff) {
-            //There is only one packet.
-            // we don't have to check for every read that packet size is enough to read another packet.
-            //read directly from stream to avoid creating byte array and copy data afterward.
+    private boolean readNextValue(int rowIndex) throws IOException, QueryException {
+        ensureResultSetCapacity(rowIndex);
+        byte[] row = packetFetcher.getRawPacket(resultSet[rowIndex]);
+        int read = row[0] & 0xff;
 
-            int read = inputStream.read() & 0xff;
-            if (logger.isTraceEnabled()) logger.trace("read packet data(part):0x" + Integer.valueOf(String.valueOf(read), 16));
-            int remaining = length - 1;
-
-            if (read == 255) { //ERROR packet
-                protocol.setActiveStreamingResult(null);
-                Buffer buffer = packetFetcher.getReusableBuffer(remaining, lastReusableArray);
-                ErrorPacket errorPacket = new ErrorPacket(buffer, false);
-                lastReusableArray = null;
-                throw new QueryException(errorPacket.getMessage(), errorPacket.getErrorNumber(), errorPacket.getSqlState());
-            }
-
-            if (read == 254 && remaining < 9) { //EOF packet
-
-                Buffer buffer = packetFetcher.getReusableBuffer(remaining, lastReusableArray);
-                protocol.setHasWarnings(((buffer.buf[0] & 0xff) + ((buffer.buf[1] & 0xff) << 8)) > 0);
-
-                //force the more packet value when this is a callable output result.
-                //There is always a OK packet after a callable output result, but mysql 5.6-7
-                //is sending a bad "more result" flag (without setting more packet to true)
-                //so force the value, since this will corrupt connection.
-                protocol.setMoreResults(callableResult
-                        || (((buffer.buf[2] & 0xff) + ((buffer.buf[3] & 0xff) << 8)) & ServerStatus.MORE_RESULTS_EXISTS) != 0,
-                        isBinaryEncoded);
-                if (!protocol.hasMoreResults()) {
-                    if (protocol.getActiveStreamingResult() == this) protocol.setActiveStreamingResult(null);
-                    protocol = null;
-                    packetFetcher = null;
-                    inputStream = null;
-                }
-                lastReusableArray = null;
-                isEof = true;
-                return false;
-            }
-
-            values.add(rowPacket.getRow(packetFetcher, inputStream, remaining, read));
-            return true;
-        }
-
-        //if not possible read with standard packet
-        Buffer buffer = packetFetcher.getReusableBuffer(length, lastReusableArray);
-        lastReusableArray = buffer.buf;
-
-        //is error Packet
-        if (buffer.getByteAt(0) == Packet.ERROR) {
+        if (read == 255) { //ERROR packet
             protocol.setActiveStreamingResult(null);
-            ErrorPacket errorPacket = new ErrorPacket(buffer);
-            lastReusableArray = null;
+            ErrorPacket errorPacket = new ErrorPacket(new Buffer(row));
             throw new QueryException(errorPacket.getMessage(), errorPacket.getErrorNumber(), errorPacket.getSqlState());
         }
 
-        //is EOF stream
-        if ((buffer.getByteAt(0) == Packet.EOF && buffer.limit < 9)) {
-            if (protocol.getActiveStreamingResult() == this) {
-                protocol.setActiveStreamingResult(null);
-            }
-            protocol.setHasWarnings(((buffer.buf[1] & 0xff) + ((buffer.buf[2] & 0xff) << 8)) > 0);
+        if (read == 254 && row.length < 9) { //EOF packet
+            protocol.setHasWarnings(((row[1] & 0xff) + ((row[2] & 0xff) << 8)) > 0);
+
+            //force the more packet value when this is a callable output result.
+            //There is always a OK packet after a callable output result, but mysql 5.6-7
+            //is sending a bad "more result" flag (without setting more packet to true)
+            //so force the value, since this will corrupt connection.
             protocol.setMoreResults(callableResult
-                            || (((buffer.buf[3] & 0xff) + ((buffer.buf[4] & 0xff) << 8)) & ServerStatus.MORE_RESULTS_EXISTS) != 0,
+                            || (((row[3] & 0xff) + ((row[4] & 0xff) << 8)) & ServerStatus.MORE_RESULTS_EXISTS) != 0,
                     isBinaryEncoded);
-            protocol = null;
-            packetFetcher = null;
-            inputStream = null;
+            if (!protocol.hasMoreResults()) {
+                if (protocol.getActiveStreamingResult() == this) protocol.setActiveStreamingResult(null);
+                protocol = null;
+                packetFetcher = null;
+            }
             isEof = true;
-            lastReusableArray = null;
             return false;
         }
-        values.add(rowPacket.getRow(packetFetcher, buffer));
+        resultSet[rowIndex] = row;
         return true;
     }
 
+    private void ensureResultSetCapacity(int minCapacity) {
+        if (minCapacity >= resultSet.length) {
+            resultSet = Arrays.copyOf(resultSet, resultSet.length * 2);
+        }
+    }
 
     /**
      * Close resultset.
@@ -500,7 +536,6 @@ public class MariaSelectResultSet implements ResultSet {
                             if (!protocol.hasMoreResults()) {
                                 if (protocol.getActiveStreamingResult() == this) protocol.setActiveStreamingResult(null);
                             }
-                            lastReusableArray = null;
                             isEof = true;
                         }
                     }
@@ -519,10 +554,10 @@ public class MariaSelectResultSet implements ResultSet {
             } finally {
                 protocol = null;
                 packetFetcher = null;
-                inputStream = null;
                 lock.unlock();
             }
         }
+        for (int i = 0; i < resultSet.length; i++) resultSet[i] = null;
 
         if (statement != null) {
             ((MariaDbStatement) statement).checkCloseOnCompletion(this);
@@ -558,21 +593,37 @@ public class MariaSelectResultSet implements ResultSet {
         }
     }
 
-    protected byte[] checkObjectRange(int position) throws SQLException {
+    protected RowStore checkObjectRange(int position) throws SQLException {
         if (this.rowPointer < 0) {
             throwError("Current position is before the first row", ExceptionCode.INVALID_PARAMETER_VALUE);
         }
         if (this.rowPointer >= resultSetSize) {
             throwError("Current position is after the last row", ExceptionCode.INVALID_PARAMETER_VALUE);
         }
-        byte[][] row = resultSet.get(this.rowPointer);
-        if (position <= 0 || position > row.length) {
+
+        byte[] row = resultSet[rowPointer];
+
+        if (position <= 0 || position > columnsInformation.length) {
             throwError("No such column: " + position, ExceptionCode.INVALID_PARAMETER_VALUE);
         }
-        byte[] vo = row[position - 1];
 
-        this.lastGetWasNull = isNull(vo, columnsInformation[position - 1].getType());
-        return vo;
+        //must compare if row is the same AND that there hasn't been new read (since arrays can be reused)
+        if (lastReadFetchTime == dataFetchTime && lastRowStore != null && lastRowPointer == rowPointer) {
+            if (lastRowStore.columnPosition == position - 1) {
+                return lastRowStore;
+            } else if (lastRowStore.columnPosition + 2 <= position) {
+                //read last read data : columnPosition begin at 0, position at 1
+                lastRowStore = rowPacket.getOffsetAndLength(row, position - 1, columnsInformation[position - 1], lastRowStore.columnPosition + 1,
+                        lastRowStore.dataOffset + lastRowStore.dataLength);
+            } else {
+                lastRowStore = rowPacket.getOffsetAndLength(row, position - 1, columnsInformation[position - 1], 0, 0);
+            }
+        } else {
+            lastRowStore = rowPacket.getOffsetAndLength(row, position - 1, columnsInformation[position - 1], 0, 0);
+        }
+        lastReadFetchTime = dataFetchTime;
+        lastRowPointer = rowPointer;
+        return lastRowStore;
     }
 
     private void throwError(String message, ExceptionCode exceptionCode) throws SQLException {
@@ -753,9 +804,14 @@ public class MariaSelectResultSet implements ResultSet {
     public void setFetchSize(int fetchSize) throws SQLException {
         if (streaming && this.fetchSize == 0) {
             try {
-                while (readNextValue(resultSet)) {
-                    //fetch all results
+
+                int loaded = this.resultSetSize;
+                while (readNextValue(loaded)) {
+                    loaded++;
                 }
+                dataFetchTime++;
+                this.resultSetSize = loaded;
+
             } catch (IOException ioException) {
                 throw new SQLException(ioException);
             } catch (QueryException queryException) {
@@ -809,7 +865,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public boolean wasNull() throws SQLException {
-        return lastGetWasNull;
+        return lastRowStore == null || lastRowStore.isNull(isBinaryEncoded);
     }
 
     /**
@@ -831,8 +887,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public String getString(int columnIndex) throws SQLException {
-        byte[] rawByte = checkObjectRange(columnIndex);
-        return getString(rawByte, columnsInformation[columnIndex - 1], cal);
+        return getString(checkObjectRange(columnIndex), cal);
     }
 
     /**
@@ -842,55 +897,53 @@ public class MariaSelectResultSet implements ResultSet {
         return getString(findColumn(columnLabel));
     }
 
-    private String getString(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        return getString(rawBytes, columnInfo, null);
+    private String getString(RowStore rowStore) throws SQLException {
+        return getString(rowStore, null);
     }
 
-    private String getString(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws SQLException {
-        if (rawBytes == null) {
-            return null;
-        }
+    private String getString(RowStore rowStore, Calendar cal) throws SQLException {
+        if (rowStore == null) return null;
 
-        switch (columnInfo.getType()) {
+        switch (rowStore.columnInfo.getType()) {
             case BIT:
-                if (options.tinyInt1isBit && columnInfo.getLength() == 1) {
-                    return (rawBytes[0] == 0) ? "0" : "1";
+                if (options.tinyInt1isBit && rowStore.columnInfo.getLength() == 1) {
+                    return (rowStore.row[rowStore.dataOffset] == 0) ? "0" : "1";
                 }
                 break;
             case TINYINT:
                 if (this.isBinaryEncoded) {
-                    return String.valueOf(getTinyInt(rawBytes, columnInfo));
+                    return String.valueOf(getTinyInt(rowStore));
                 }
                 break;
             case SMALLINT:
                 if (this.isBinaryEncoded) {
-                    return String.valueOf(getSmallInt(rawBytes, columnInfo));
+                    return String.valueOf(getSmallInt(rowStore));
                 }
                 break;
             case INTEGER:
             case MEDIUMINT:
                 if (this.isBinaryEncoded) {
-                    return String.valueOf(getMediumInt(rawBytes, columnInfo));
+                    return String.valueOf(getMediumInt(rowStore));
                 }
                 break;
             case BIGINT:
                 if (this.isBinaryEncoded) {
-                    if (!columnInfo.isSigned()) {
-                        return String.valueOf(getBigInteger(rawBytes, columnInfo));
+                    if (!rowStore.columnInfo.isSigned()) {
+                        return String.valueOf(getBigInteger(rowStore));
                     }
-                    return String.valueOf(getLong(rawBytes, columnInfo));
+                    return String.valueOf(getLong(rowStore));
                 }
                 break;
             case DOUBLE:
-                return String.valueOf(getDouble(rawBytes, columnInfo));
+                return String.valueOf(getDouble(rowStore));
             case FLOAT:
-                return String.valueOf(getFloat(rawBytes, columnInfo));
+                return String.valueOf(getFloat(rowStore));
             case TIME:
-                return getTimeString(rawBytes, columnInfo);
+                return getTimeString(rowStore);
             case DATE:
                 if (isBinaryEncoded) {
                     try {
-                        Date date = getDate(rawBytes, columnInfo, cal);
+                        Date date = getDate(rowStore, cal);
                         return (date == null) ? null : date.toString();
                     } catch (ParseException e) {
                     }
@@ -899,47 +952,45 @@ public class MariaSelectResultSet implements ResultSet {
             case YEAR:
                 if (options.yearIsDateType) {
                     try {
-                        Date date = getDate(rawBytes, columnInfo, cal);
+                        Date date = getDate(rowStore, cal);
                         return (date == null) ? null : date.toString();
                     } catch (ParseException e) {
                         //eat exception
                     }
                 }
                 if (this.isBinaryEncoded) {
-                    return String.valueOf(getSmallInt(rawBytes, columnInfo));
+                    return String.valueOf(getSmallInt(rowStore));
                 }
                 break;
             case TIMESTAMP:
             case DATETIME:
                 try {
-                    Timestamp timestamp = getTimestamp(rawBytes, columnInfo, cal);
+                    Timestamp timestamp = getTimestamp(rowStore, cal);
                     return (timestamp == null) ? null : timestamp.toString();
                 } catch (ParseException e) {
                 }
                 break;
             case DECIMAL:
             case OLDDECIMAL:
-                BigDecimal bigDecimal = getBigDecimal(rawBytes, columnInfo);
+                BigDecimal bigDecimal = getBigDecimal(rowStore);
                 return (bigDecimal == null ) ? null : bigDecimal.toString();
             case GEOMETRY:
-                return new String(rawBytes);
+                return new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength);
             case NULL:
                 return null;
             default:
-                return new String(rawBytes, StandardCharsets.UTF_8);
+                return new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
         }
-        return new String(rawBytes, StandardCharsets.UTF_8);
+        return new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
     }
 
     /**
      * {inheritDoc}.
      */
     public InputStream getBinaryStream(int columnIndex) throws SQLException {
-        byte[] rawBytes = checkObjectRange(columnIndex);
-        if (rawBytes == null) {
-            return null;
-        }
-        return new ByteArrayInputStream(rawBytes);
+        RowStore rowStore = checkObjectRange(columnIndex);
+        if (rowStore == null) return null;
+        return new ByteArrayInputStream(rowStore.row, rowStore.dataOffset, rowStore.dataLength);
     }
 
     /**
@@ -953,7 +1004,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public int getInt(int columnIndex) throws SQLException {
-        return getInt(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getInt(checkObjectRange(columnIndex));
     }
 
     /**
@@ -967,53 +1018,51 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get int from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return int
      */
-    private int getInt(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private int getInt(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
+
         if (!this.isBinaryEncoded) {
-            return parseInt(rawBytes, columnInfo);
+            return parseInt(rowStore);
         } else {
             long value;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    value = getTinyInt(rawBytes, columnInfo);
+                    value = getTinyInt(rowStore);
                     break;
                 case SMALLINT:
                 case YEAR:
-                    value = getSmallInt(rawBytes, columnInfo);
+                    value = getSmallInt(rowStore);
                     break;
                 case INTEGER:
                 case MEDIUMINT:
-                    value = ((rawBytes[0] & 0xff)
-                            + ((rawBytes[1] & 0xff) << 8)
-                            + ((rawBytes[2] & 0xff) << 16)
-                            + ((rawBytes[3] & 0xff) << 24));
-                    if (columnInfo.isSigned()) {
+                    value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24));
+                    if (rowStore.columnInfo.isSigned()) {
                         return (int) value;
                     } else if (value < 0) {
                         value = value & 0xffffffffL;
                     }
                     break;
                 case BIGINT:
-                    value = getLong(rawBytes, columnInfo);
+                    value = getLong(rowStore);
                     break;
                 case FLOAT:
-                    value = (long) getFloat(rawBytes, columnInfo);
+                    value = (long) getFloat(rowStore);
                     break;
                 case DOUBLE:
-                    value = (long) getDouble(rawBytes, columnInfo);
+                    value = (long) getDouble(rowStore);
                     break;
                 default:
-                    return parseInt(rawBytes, columnInfo);
+                    return parseInt(rowStore);
             }
-            rangeCheck(Integer.class, Integer.MIN_VALUE, Integer.MAX_VALUE, value, columnInfo);
+            rangeCheck(Integer.class, Integer.MIN_VALUE, Integer.MAX_VALUE, value, rowStore.columnInfo);
             return (int) value;
         }
     }
@@ -1029,49 +1078,47 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public long getLong(int columnIndex) throws SQLException {
-        return getLong(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getLong(checkObjectRange(columnIndex));
     }
 
     /**
      * Get long from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return long
      * @throws SQLException if any error occur
      */
-    private long getLong(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private long getLong(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
+
         if (!this.isBinaryEncoded) {
-            return parseLong(rawBytes, columnInfo);
+            return parseLong(rowStore);
         } else {
             long value;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    value = getTinyInt(rawBytes, columnInfo);
+                    value = getTinyInt(rowStore);
                     break;
                 case SMALLINT:
                 case YEAR:
-                    value = getSmallInt(rawBytes, columnInfo);
+                    value = getSmallInt(rowStore);
                     break;
                 case INTEGER:
                 case MEDIUMINT:
-                    value = getMediumInt(rawBytes, columnInfo);
+                    value = getMediumInt(rowStore);
                     break;
                 case BIGINT:
-                    value = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56));
-                    if (columnInfo.isSigned()) {
+                    value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56));
+                    if (rowStore.columnInfo.isSigned()) {
                         return value;
                     }
                     BigInteger unsignedValue = new BigInteger(1, new byte[]{(byte) (value >> 56),
@@ -1079,28 +1126,28 @@ public class MariaSelectResultSet implements ResultSet {
                             (byte) (value >> 24), (byte) (value >> 16), (byte) (value >> 8),
                             (byte) (value >> 0)});
                     if (unsignedValue.compareTo(new BigInteger(String.valueOf(Long.MAX_VALUE))) > 0) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
                                 + unsignedValue + " is not in Long range", "22003", 1264);
                     }
                     return unsignedValue.longValue();
                 case FLOAT:
-                    Float floatValue = getFloat(rawBytes, columnInfo);
+                    Float floatValue = getFloat(rowStore);
                     if (floatValue.compareTo((float) Long.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + floatValue
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + floatValue
                                 + " is not in Long range", "22003", 1264);
                     }
                     return floatValue.longValue();
                 case DOUBLE:
-                    Double doubleValue = getDouble(rawBytes, columnInfo);
+                    Double doubleValue = getDouble(rowStore);
                     if (doubleValue.compareTo((double) Long.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + doubleValue
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + doubleValue
                                 + " is not in Long range", "22003", 1264);
                     }
                     return doubleValue.longValue();
                 default:
-                    return parseLong(rawBytes, columnInfo);
+                    return parseLong(rowStore);
             }
-            rangeCheck(Long.class, Long.MIN_VALUE, Long.MAX_VALUE, value, columnInfo);
+            rangeCheck(Long.class, Long.MIN_VALUE, Long.MAX_VALUE, value, rowStore.columnInfo);
             return value;
 
         }
@@ -1117,49 +1164,47 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public float getFloat(int columnIndex) throws SQLException {
-        return getFloat(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getFloat(checkObjectRange(columnIndex));
     }
 
     /**
      * Get float from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return float
      * @throws SQLException id any error occur
      */
-    private float getFloat(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private float getFloat(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
+
         if (!this.isBinaryEncoded) {
-            return Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+            return Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
         } else {
             long value;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    value = getTinyInt(rawBytes, columnInfo);
+                    value = getTinyInt(rowStore);
                     break;
                 case SMALLINT:
                 case YEAR:
-                    value = getSmallInt(rawBytes, columnInfo);
+                    value = getSmallInt(rowStore);
                     break;
                 case INTEGER:
                 case MEDIUMINT:
-                    value = getMediumInt(rawBytes, columnInfo);
+                    value = getMediumInt(rowStore);
                     break;
                 case BIGINT:
-                    value = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56));
-                    if (columnInfo.isSigned()) {
+                    value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56));
+                    if (rowStore.columnInfo.isSigned()) {
                         return value;
                     }
                     BigInteger unsignedValue = new BigInteger(1, new byte[]{(byte) (value >> 56),
@@ -1168,15 +1213,15 @@ public class MariaSelectResultSet implements ResultSet {
                             (byte) (value >> 0)});
                     return unsignedValue.floatValue();
                 case FLOAT:
-                    int valueFloat = ((rawBytes[0] & 0xff)
-                            + ((rawBytes[1] & 0xff) << 8)
-                            + ((rawBytes[2] & 0xff) << 16)
-                            + ((rawBytes[3] & 0xff) << 24));
+                    int valueFloat = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24));
                     return Float.intBitsToFloat(valueFloat);
                 case DOUBLE:
-                    return (float) getDouble(rawBytes, columnInfo);
+                    return (float) getDouble(rowStore);
                 default:
-                    return Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
             return Float.valueOf(String.valueOf(value));
         }
@@ -1194,47 +1239,45 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public double getDouble(int columnIndex) throws SQLException {
-        return getDouble(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getDouble(checkObjectRange(columnIndex));
     }
 
 
     /**
      * Get double value from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return double
      * @throws SQLException id any error occur
      */
-    private double getDouble(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private double getDouble(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
+
         if (!this.isBinaryEncoded) {
-            return Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+            return Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
         } else {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    return getTinyInt(rawBytes, columnInfo);
+                    return getTinyInt(rowStore);
                 case SMALLINT:
                 case YEAR:
-                    return getSmallInt(rawBytes, columnInfo);
+                    return getSmallInt(rowStore);
                 case INTEGER:
                 case MEDIUMINT:
-                    return getMediumInt(rawBytes, columnInfo);
+                    return getMediumInt(rowStore);
                 case BIGINT:
-                    long valueLong = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56)
+                    long valueLong = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56)
                     );
-                    if (columnInfo.isSigned()) {
+                    if (rowStore.columnInfo.isSigned()) {
                         return valueLong;
                     } else {
                         return new BigInteger(1, new byte[]{(byte) (valueLong >> 56),
@@ -1243,19 +1286,19 @@ public class MariaSelectResultSet implements ResultSet {
                                 (byte) (valueLong >> 0)}).doubleValue();
                     }
                 case FLOAT:
-                    return getFloat(rawBytes, columnInfo);
+                    return getFloat(rowStore);
                 case DOUBLE:
-                    long valueDouble = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56));
+                    long valueDouble = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56));
                     return Double.longBitsToDouble(valueDouble);
                 default:
-                    return Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         }
     }
@@ -1271,14 +1314,14 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public BigDecimal getBigDecimal(int columnIndex, int scale) throws SQLException {
-        return getBigDecimal(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getBigDecimal(checkObjectRange(columnIndex));
     }
 
     /**
      * {inheritDoc}.
      */
     public BigDecimal getBigDecimal(int columnIndex) throws SQLException {
-        return getBigDecimal(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        return getBigDecimal(checkObjectRange(columnIndex));
     }
 
     /**
@@ -1292,53 +1335,51 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get BigDecimal from rax data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return Bigdecimal value
      * @throws SQLException id any error occur
      */
-    private BigDecimal getBigDecimal(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return null;
-        }
+    private BigDecimal getBigDecimal(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return null;
+
         if (!this.isBinaryEncoded) {
-            return new BigDecimal(new String(rawBytes, StandardCharsets.UTF_8));
+            return new BigDecimal(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
         } else {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return BigDecimal.valueOf((long) rawBytes[0]);
+                    return BigDecimal.valueOf((long) rowStore.row[rowStore.dataOffset]);
                 case TINYINT:
-                    return BigDecimal.valueOf((long) getTinyInt(rawBytes, columnInfo));
+                    return BigDecimal.valueOf((long) getTinyInt(rowStore));
                 case SMALLINT:
                 case YEAR:
-                    return BigDecimal.valueOf((long) getSmallInt(rawBytes, columnInfo));
+                    return BigDecimal.valueOf((long) getSmallInt(rowStore));
                 case INTEGER:
                 case MEDIUMINT:
-                    return BigDecimal.valueOf(getMediumInt(rawBytes, columnInfo));
+                    return BigDecimal.valueOf(getMediumInt(rowStore));
                 case BIGINT:
-                    long value = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56)
+                    long value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56)
                     );
-                    if (columnInfo.isSigned()) {
-                        return new BigDecimal(String.valueOf(BigInteger.valueOf(value))).setScale(columnInfo.getDecimals());
+                    if (rowStore.columnInfo.isSigned()) {
+                        return new BigDecimal(String.valueOf(BigInteger.valueOf(value))).setScale(rowStore.columnInfo.getDecimals());
                     } else {
                         return new BigDecimal(String.valueOf(new BigInteger(1, new byte[]{(byte) (value >> 56),
                                 (byte) (value >> 48), (byte) (value >> 40), (byte) (value >> 32),
                                 (byte) (value >> 24), (byte) (value >> 16), (byte) (value >> 8),
-                                (byte) (value >> 0)}))).setScale(columnInfo.getDecimals());
+                                (byte) (value >> 0)}))).setScale(rowStore.columnInfo.getDecimals());
                     }
                 case FLOAT:
-                    return BigDecimal.valueOf(getFloat(rawBytes, columnInfo));
+                    return BigDecimal.valueOf(getFloat(rowStore));
                 case DOUBLE:
-                    return BigDecimal.valueOf(getDouble(rawBytes, columnInfo));
+                    return BigDecimal.valueOf(getDouble(rowStore));
                 default:
-                    return new BigDecimal(new String(rawBytes, StandardCharsets.UTF_8));
+                    return new BigDecimal(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         }
 
@@ -1355,7 +1396,11 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public byte[] getBytes(int columnIndex) throws SQLException {
-        return checkObjectRange(columnIndex);
+        RowStore rowStore = checkObjectRange(columnIndex);
+        if (rowStore == null) return null;
+        byte[] bytes = new byte[rowStore.dataLength];
+        System.arraycopy(rowStore.row, rowStore.dataOffset, bytes, 0, rowStore.dataLength);
+        return bytes;
     }
 
     /**
@@ -1363,10 +1408,10 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Date getDate(int columnIndex) throws SQLException {
         try {
-            return getDate(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getDate(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse column as date, was: \""
-                    + getString(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1])
+                    + getString(checkObjectRange(columnIndex))
                     + "\"", e);
         }
     }
@@ -1383,7 +1428,7 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Date getDate(int columnIndex, Calendar cal) throws SQLException {
         try {
-            return getDate(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getDate(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse as date");
         }
@@ -1400,19 +1445,17 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get date from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @param cal        session calendar
      * @return date
      * @throws ParseException if raw data cannot be parse
      */
-    private Date getDate(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        if (rawBytes == null) {
-            return null;
-        }
+    private Date getDate(RowStore rowStore, Calendar cal) throws ParseException {
+        if (rowStore == null || rowStore.dataLength == 0) return null;
+
 
         if (!this.isBinaryEncoded) {
-            String rawValue = new String(rawBytes, StandardCharsets.UTF_8);
+            String rawValue = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             String zeroDate = "0000-00-00";
 
             if (rawValue.equals(zeroDate)) {
@@ -1420,14 +1463,14 @@ public class MariaSelectResultSet implements ResultSet {
             }
 
             SimpleDateFormat sdf;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case TIMESTAMP:
                 case DATETIME:
-                    Timestamp timestamp = getTimestamp(rawBytes, columnInfo, cal);
+                    Timestamp timestamp = getTimestamp(rowStore, cal);
                     if (timestamp == null) return null;
                     return new Date(timestamp.getTime());
                 case TIME:
-                    Time time = getTime(rawBytes, columnInfo, cal);
+                    Time time = getTime(rowStore, cal);
                     if (time == null) return null;
                     return new Date(time.getTime());
                 case DATE:
@@ -1438,7 +1481,7 @@ public class MariaSelectResultSet implements ResultSet {
                     );
                 case YEAR:
                     int year = Integer.parseInt(rawValue);
-                    if (rawBytes.length == 2 && columnInfo.getLength() == 2) {
+                    if (rowStore.dataLength == 2 && rowStore.columnInfo.getLength() == 2) {
                         if (year <= 69) {
                             year += 2000;
                         } else {
@@ -1456,7 +1499,7 @@ public class MariaSelectResultSet implements ResultSet {
             java.util.Date utilDate = sdf.parse(rawValue);
             return new Date(utilDate.getTime());
         } else {
-            return binaryDate(rawBytes, columnInfo, cal);
+            return binaryDate(rowStore, cal);
         }
     }
 
@@ -1465,10 +1508,10 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Time getTime(int columnIndex) throws SQLException {
         try {
-            return getTime(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getTime(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse column as time, was: \""
-                    + getString(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1])
+                    + getString(checkObjectRange(columnIndex))
                     + "\"", e);
         }
     }
@@ -1486,7 +1529,7 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Time getTime(int columnIndex, Calendar cal) throws SQLException {
         try {
-            return getTime(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getTime(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse time", e);
         }
@@ -1502,27 +1545,23 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get time from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @param cal        session calendar
      * @return time value
      * @throws ParseException if raw data cannot be parse
      */
-    private Time getTime(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        if (rawBytes == null) {
-            return null;
-        }
-        String raw = new String(rawBytes, StandardCharsets.UTF_8);
+    private Time getTime(RowStore rowStore, Calendar cal) throws ParseException {
+        if (rowStore == null) return null;
+
+        String raw = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
         String zeroDate = "0000-00-00";
-        if (raw.equals(zeroDate)) {
-            return null;
-        }
+        if (raw.equals(zeroDate)) return null;
 
         if (!this.isBinaryEncoded) {
-            if (columnInfo.getType() == MariaDbType.TIMESTAMP || columnInfo.getType() == MariaDbType.DATETIME) {
-                Timestamp timestamp = getTimestamp(rawBytes, columnInfo, cal);
+            if (rowStore.columnInfo.getType() == MariaDbType.TIMESTAMP || rowStore.columnInfo.getType() == MariaDbType.DATETIME) {
+                Timestamp timestamp = getTimestamp(rowStore, cal);
                 return (timestamp == null) ? null : new Time(timestamp.getTime());
-            } else if (columnInfo.getType() == MariaDbType.DATE) {
+            } else if (rowStore.columnInfo.getType() == MariaDbType.DATE) {
                 Calendar zeroCal = Calendar.getInstance();
                 zeroCal.set(1970, 0, 1, 0, 0, 0);
                 zeroCal.set(Calendar.MILLISECOND, 0);
@@ -1555,7 +1594,7 @@ public class MariaSelectResultSet implements ResultSet {
                 }
             }
         } else {
-            return binaryTime(rawBytes, columnInfo, cal);
+            return binaryTime(rowStore, cal);
         }
     }
 
@@ -1572,7 +1611,7 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Timestamp getTimestamp(int columnIndex, Calendar cal) throws SQLException {
         try {
-            return getTimestamp(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getTimestamp(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse timestamp", e);
         }
@@ -1590,10 +1629,10 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Timestamp getTimestamp(int columnIndex) throws SQLException {
         try {
-            return getTimestamp(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal);
+            return getTimestamp(checkObjectRange(columnIndex), cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not parse column as timestamp, was: \""
-                    + getString(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1])
+                    + getString(checkObjectRange(columnIndex))
                     + "\"", e);
         }
     }
@@ -1601,24 +1640,22 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get timeStamp from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @param cal        session calendar.
      * @return timestamp.
      * @throws ParseException if text value cannot be parse
      */
-    private Timestamp getTimestamp(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        if (rawBytes == null) {
-            return null;
-        }
+    private Timestamp getTimestamp(RowStore rowStore, Calendar cal) throws ParseException {
+        if (rowStore == null || rowStore.dataLength == 0) return null;
+
         if (!this.isBinaryEncoded) {
-            String rawValue = new String(rawBytes, StandardCharsets.UTF_8);
+            String rawValue = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             if (rawValue.startsWith("0000-00-00 00:00:00")) return null;
 
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case TIME:
                     //time does not go after millisecond
-                    Timestamp tt = new Timestamp(getTime(rawBytes, columnInfo, cal).getTime());
+                    Timestamp tt = new Timestamp(getTime(rowStore, cal).getTime());
                     tt.setNanos(extractNanos(rawValue));
                     return tt;
                 default:
@@ -1659,7 +1696,7 @@ public class MariaSelectResultSet implements ResultSet {
                     }
             }
         } else {
-            return binaryTimestamp(rawBytes, columnInfo, cal);
+            return binaryTimestamp(rowStore, cal);
         }
 
     }
@@ -1697,7 +1734,7 @@ public class MariaSelectResultSet implements ResultSet {
      */
     public Object getObject(int columnIndex) throws SQLException {
         try {
-            return getObject(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], dataTypeMappingFlags, cal);
+            return getObject(checkObjectRange(columnIndex), dataTypeMappingFlags, cal);
         } catch (ParseException e) {
             throw ExceptionMapper.getSqlException("Could not get object: " + e.getMessage(), "S1009", e);
         }
@@ -1768,7 +1805,7 @@ public class MariaSelectResultSet implements ResultSet {
         } else if (type.equals(BigDecimal.class)) {
             return (T) getBigDecimal(parameterIndex);
         } else if (type.equals(BigInteger.class)) {
-            return (T) getBigInteger(checkObjectRange(parameterIndex), columnsInformation[parameterIndex - 1]);
+            return (T) getBigInteger(checkObjectRange(parameterIndex));
         } else if (type.equals(Clob.class)) {
             return (T) getClob(parameterIndex);
         }
@@ -1790,87 +1827,88 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get object value.
      *
-     * @param rawBytes             bytes
-     * @param columnInfo           current column information
+     * @param rowStore object that store data byte infos
      * @param dataTypeMappingFlags dataTypeflag (year is date or int, bit boolean or int,  ...)
      * @param cal                  session calendar
      * @return the object value.
      * @throws ParseException if data cannot be parse
      */
-    private Object getObject(byte[] rawBytes, ColumnInformation columnInfo, int dataTypeMappingFlags, Calendar cal)
+    private Object getObject(RowStore rowStore, int dataTypeMappingFlags, Calendar cal)
             throws SQLException, ParseException {
-        if (rawBytes == null) {
-            return null;
-        }
+        if (rowStore == null) return null;
 
-        switch (columnInfo.getType()) {
+        switch (rowStore.columnInfo.getType()) {
             case BIT:
-                if (columnInfo.getLength() == 1) {
-                    return rawBytes[0] != 0;
+                if (rowStore.columnInfo.getLength() == 1) {
+                    return rowStore.row[rowStore.dataOffset] != 0;
                 }
-                return rawBytes;
+                byte[] bitBytes = new byte[rowStore.dataLength];
+                System.arraycopy(rowStore.row, rowStore.dataOffset, bitBytes, 0, rowStore.dataLength);
+                return bitBytes;
             case TINYINT:
-                if (options.tinyInt1isBit && columnInfo.getLength() == 1) {
+                if (options.tinyInt1isBit && rowStore.columnInfo.getLength() == 1) {
                     if (!this.isBinaryEncoded) {
-                        return rawBytes[0] != '0';
+                        return rowStore.row[rowStore.dataOffset] != '0';
                     } else {
-                        return rawBytes[0] != 0;
+                        return rowStore.row[rowStore.dataOffset] != 0;
                     }
                 }
-                return getInt(rawBytes, columnInfo);
+                return getInt(rowStore);
             case INTEGER:
-                if (!columnInfo.isSigned()) {
-                    return getLong(rawBytes, columnInfo);
-                }
-                return getInt(rawBytes, columnInfo);
+                if (!rowStore.columnInfo.isSigned()) return getLong(rowStore);
+                return getInt(rowStore);
             case BIGINT:
-                if (!columnInfo.isSigned()) {
-                    return getBigInteger(rawBytes, columnInfo);
-                }
-                return getLong(rawBytes, columnInfo);
+                if (!rowStore.columnInfo.isSigned()) return getBigInteger(rowStore);
+                return getLong(rowStore);
             case DOUBLE:
-                return getDouble(rawBytes, columnInfo);
+                return getDouble(rowStore);
             case TIMESTAMP:
             case DATETIME:
-                return getTimestamp(rawBytes, columnInfo, cal);
+                return getTimestamp(rowStore, cal);
             case DATE:
-                return getDate(rawBytes, columnInfo, cal);
+                return getDate(rowStore, cal);
             case VARCHAR:
-                if (columnInfo.isBinary()) {
-                    return rawBytes;
+                if (rowStore.columnInfo.isBinary()) {
+                    byte[] varcharBytes = new byte[rowStore.dataLength];
+                    System.arraycopy(rowStore.row, rowStore.dataOffset, varcharBytes, 0, rowStore.dataLength);
+                    return varcharBytes;
                 }
-                return getString(rawBytes, columnInfo);
+                return getString(rowStore);
             case DECIMAL:
-                return getBigDecimal(rawBytes, columnInfo);
+                return getBigDecimal(rowStore);
             case BLOB:
             case LONGBLOB:
             case MEDIUMBLOB:
             case TINYBLOB:
-                return rawBytes;
+                byte[] blobBytes = new byte[rowStore.dataLength];
+                System.arraycopy(rowStore.row, rowStore.dataOffset, blobBytes, 0, rowStore.dataLength);
+                return blobBytes;
             case NULL:
                 return null;
             case YEAR:
-                if ((dataTypeMappingFlags & YEAR_IS_DATE_TYPE) != 0) {
-                    return getDate(rawBytes, columnInfo, cal);
-                }
-                return getShort(rawBytes, columnInfo);
+                if ((dataTypeMappingFlags & YEAR_IS_DATE_TYPE) != 0) return getDate(rowStore, cal);
+                return getShort(rowStore);
             case SMALLINT:
             case MEDIUMINT:
-                return getInt(rawBytes, columnInfo);
+                return getInt(rowStore);
             case FLOAT:
-                return getFloat(rawBytes, columnInfo);
+                return getFloat(rowStore);
             case TIME:
-                return getTime(rawBytes, columnInfo, cal);
+                return getTime(rowStore, cal);
             case VARSTRING:
             case STRING:
-                if (columnInfo.isBinary()) {
-                    return rawBytes;
+                if (rowStore.columnInfo.isBinary()) {
+                    byte[] bytes = new byte[rowStore.dataLength];
+                    System.arraycopy(rowStore.row, rowStore.dataOffset, bytes, 0, rowStore.dataLength);
+                    return bytes;
                 }
-                return getString(rawBytes, columnInfo);
+                return getString(rowStore);
             case OLDDECIMAL:
-                return getString(rawBytes, columnInfo);
+                return getString(rowStore);
             case GEOMETRY:
-                return rawBytes;
+                byte[] bytes = new byte[rowStore.dataLength];
+                System.arraycopy(rowStore.row, rowStore.dataOffset, bytes, 0, rowStore.dataLength);
+                return bytes;
             case ENUM:
                 break;
             case NEWDATE:
@@ -1880,7 +1918,7 @@ public class MariaSelectResultSet implements ResultSet {
             default:
                 break;
         }
-        throw new RuntimeException(columnInfo.getType().toString());
+        throw new RuntimeException(rowStore.columnInfo.getType().toString());
     }
 
 
@@ -1902,7 +1940,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public Reader getCharacterStream(int columnIndex) throws SQLException {
-        String value = getString(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1]);
+        String value = getString(checkObjectRange(columnIndex));
         if (value == null) {
             return null;
         }
@@ -2363,11 +2401,9 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public Blob getBlob(int columnIndex) throws SQLException {
-        byte[] bytes = checkObjectRange(columnIndex);
-        if (bytes == null) {
-            return null;
-        }
-        return new MariaDbBlob(bytes);
+        RowStore rowStore = checkObjectRange(columnIndex);
+        if (rowStore == null) return null;
+        return new MariaDbBlob(rowStore.row, rowStore.dataOffset, rowStore.dataLength);
     }
 
     /**
@@ -2381,11 +2417,9 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public Clob getClob(int columnIndex) throws SQLException {
-        byte[] bytes = checkObjectRange(columnIndex);
-        if (bytes == null) {
-            return null;
-        }
-        return new MariaDbClob(bytes);
+        RowStore rowStore = checkObjectRange(columnIndex);
+        if (rowStore == null) return null;
+        return new MariaDbClob(rowStore.row, rowStore.dataOffset, rowStore.dataLength);
     }
 
     /**
@@ -2415,7 +2449,7 @@ public class MariaSelectResultSet implements ResultSet {
     @Override
     public URL getURL(int columnIndex) throws SQLException {
         try {
-            return new URL(getString(checkObjectRange(columnIndex), columnsInformation[columnIndex - 1], cal));
+            return new URL(getString(checkObjectRange(columnIndex), cal));
         } catch (MalformedURLException e) {
             throw ExceptionMapper.getSqlException("Could not parse as URL");
         }
@@ -2638,9 +2672,9 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public NClob getNClob(int columnIndex) throws SQLException {
-        byte[] bytes = checkObjectRange(columnIndex);
-        if (bytes == null) return null;
-        return new MariaDbClob(bytes);
+        RowStore rowStore = checkObjectRange(columnIndex);
+        if (rowStore == null) return null;
+        return new MariaDbClob(rowStore.row, rowStore.dataOffset, rowStore.dataLength);
     }
 
     /**
@@ -2728,7 +2762,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public boolean getBoolean(int index) throws SQLException {
-        return getBoolean(checkObjectRange(index), columnsInformation[index - 1]);
+        return getBoolean(checkObjectRange(index));
     }
 
     /**
@@ -2742,41 +2776,39 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get boolean value from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return boolean
      * @throws SQLException id any error occur
      */
-    private boolean getBoolean(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return false;
-        }
+    private boolean getBoolean(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return false;
+
         if (!this.isBinaryEncoded) {
-            if (rawBytes.length == 1 && rawBytes[0] == 0) {
+            if (rowStore.dataLength == 1 && rowStore.row[rowStore.dataOffset] == 0) {
                 return false;
             }
-            final String rawVal = new String(rawBytes, StandardCharsets.UTF_8);
+            final String rawVal = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             return !("false".equals(rawVal) || "0".equals(rawVal));
         } else {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0] != 0;
+                    return rowStore.row[rowStore.dataOffset] != 0;
                 case TINYINT:
-                    return getTinyInt(rawBytes, columnInfo) != 0;
+                    return getTinyInt(rowStore) != 0;
                 case SMALLINT:
                 case YEAR:
-                    return getSmallInt(rawBytes, columnInfo) != 0;
+                    return getSmallInt(rowStore) != 0;
                 case INTEGER:
                 case MEDIUMINT:
-                    return getMediumInt(rawBytes, columnInfo) != 0;
+                    return getMediumInt(rowStore) != 0;
                 case BIGINT:
-                    return getLong(rawBytes, columnInfo) != 0;
+                    return getLong(rowStore) != 0;
                 case FLOAT:
-                    return getFloat(rawBytes, columnInfo) != 0;
+                    return getFloat(rowStore) != 0;
                 case DOUBLE:
-                    return getDouble(rawBytes, columnInfo) != 0;
+                    return getDouble(rowStore) != 0;
                 default:
-                    final String rawVal = new String(rawBytes, StandardCharsets.UTF_8);
+                    final String rawVal = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
                     return !("false".equals(rawVal) || "0".equals(rawVal));
             }
         }
@@ -2786,7 +2818,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public byte getByte(int index) throws SQLException {
-        return getByte(checkObjectRange(index), columnsInformation[index - 1]);
+        return getByte(checkObjectRange(index));
     }
 
     /**
@@ -2799,49 +2831,47 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get byte from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return byte
      * @throws SQLException id any error occur
      */
-    private byte getByte(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private byte getByte(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
+
         if (!this.isBinaryEncoded) {
-            if (columnInfo.getType() == MariaDbType.BIT) {
-                return rawBytes[0];
+            if (rowStore.columnInfo.getType() == MariaDbType.BIT) {
+                return rowStore.row[rowStore.dataOffset];
             }
-            return parseByte(rawBytes, columnInfo);
+            return parseByte(rowStore);
         } else {
             long value;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    value = getTinyInt(rawBytes, columnInfo);
+                    value = getTinyInt(rowStore);
                     break;
                 case SMALLINT:
                 case YEAR:
-                    value = getSmallInt(rawBytes, columnInfo);
+                    value = getSmallInt(rowStore);
                     break;
                 case INTEGER:
                 case MEDIUMINT:
-                    value = getMediumInt(rawBytes, columnInfo);
+                    value = getMediumInt(rowStore);
                     break;
                 case BIGINT:
-                    value = getLong(rawBytes, columnInfo);
+                    value = getLong(rowStore);
                     break;
                 case FLOAT:
-                    value = (long) getFloat(rawBytes, columnInfo);
+                    value = (long) getFloat(rowStore);
                     break;
                 case DOUBLE:
-                    value = (long) getDouble(rawBytes, columnInfo);
+                    value = (long) getDouble(rowStore);
                     break;
                 default:
-                    return parseByte(rawBytes, columnInfo);
+                    return parseByte(rowStore);
             }
-            rangeCheck(Byte.class, Byte.MIN_VALUE, Byte.MAX_VALUE, value, columnInfo);
+            rangeCheck(Byte.class, Byte.MIN_VALUE, Byte.MAX_VALUE, value, rowStore.columnInfo);
             return (byte) value;
         }
     }
@@ -2850,7 +2880,7 @@ public class MariaSelectResultSet implements ResultSet {
      * {inheritDoc}.
      */
     public short getShort(int index) throws SQLException {
-        return getShort(checkObjectRange(index), columnsInformation[index - 1]);
+        return getShort(checkObjectRange(index));
     }
 
     /**
@@ -2863,51 +2893,48 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get short from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return short
      * @throws SQLException exception
      * @throws SQLException id any error occur
      */
-    private short getShort(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return 0;
-        }
+    private short getShort(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return 0;
         if (!this.isBinaryEncoded) {
-            return parseShort(rawBytes, columnInfo);
+            return parseShort(rowStore);
         } else {
             long value;
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return rawBytes[0];
+                    return rowStore.row[rowStore.dataOffset];
                 case TINYINT:
-                    value = getTinyInt(rawBytes, columnInfo);
+                    value = getTinyInt(rowStore);
                     break;
                 case SMALLINT:
                 case YEAR:
-                    value = ((rawBytes[0] & 0xff) + ((rawBytes[1] & 0xff) << 8));
-                    if (columnInfo.isSigned()) {
+                    value = ((rowStore.row[rowStore.dataOffset] & 0xff) + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8));
+                    if (rowStore.columnInfo.isSigned()) {
                         return (short) value;
                     }
                     value = value & 0xffff;
                     break;
                 case INTEGER:
                 case MEDIUMINT:
-                    value = getMediumInt(rawBytes, columnInfo);
+                    value = getMediumInt(rowStore);
                     break;
                 case BIGINT:
-                    value = getLong(rawBytes, columnInfo);
+                    value = getLong(rowStore);
                     break;
                 case FLOAT:
-                    value = (long) getFloat(rawBytes, columnInfo);
+                    value = (long) getFloat(rowStore);
                     break;
                 case DOUBLE:
-                    value = (long) getDouble(rawBytes, columnInfo);
+                    value = (long) getDouble(rowStore);
                     break;
                 default:
-                    return parseShort(rawBytes, columnInfo);
+                    return parseShort(rowStore);
             }
-            rangeCheck(Short.class, Short.MIN_VALUE, Short.MAX_VALUE, value, columnInfo);
+            rangeCheck(Short.class, Short.MIN_VALUE, Short.MAX_VALUE, value, rowStore.columnInfo);
             return (short) value;
         }
     }
@@ -2930,20 +2957,20 @@ public class MariaSelectResultSet implements ResultSet {
         this.returnTableAlias = returnTableAlias;
     }
 
-    private String getTimeString(byte[] rawBytes, ColumnInformation columnInfo) {
-        if (rawBytes == null) return null;
-        if (rawBytes.length == 0) {
+    private String getTimeString(RowStore rowStore) {
+        if (rowStore == null) return null;
+        if (rowStore.dataLength == 0) {
             // binary send 00:00:00 as 0.
-            if (columnInfo.getDecimals() == 0) {
+            if (rowStore.columnInfo.getDecimals() == 0) {
                 return "00:00:00";
             } else {
                 String value = "00:00:00.";
-                int decimal = columnInfo.getDecimals();
+                int decimal = rowStore.columnInfo.getDecimals();
                 while (decimal-- > 0) value += "0";
                 return value;
             }
         }
-        String rawValue = new String(rawBytes, StandardCharsets.UTF_8);
+        String rawValue = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
         if ("0000-00-00".equals(rawValue)) {
             return null;
         }
@@ -2953,11 +2980,11 @@ public class MariaSelectResultSet implements ResultSet {
             }
             return rawValue;
         }
-        int day = ((rawBytes[1] & 0xff)
-                | ((rawBytes[2] & 0xff) << 8)
-                | ((rawBytes[3] & 0xff) << 16)
-                | ((rawBytes[4] & 0xff) << 24));
-        int hour = rawBytes[5];
+        int day = ((rowStore.row[rowStore.dataOffset + 1] & 0xff)
+                | ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 8)
+                | ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 16)
+                | ((rowStore.row[rowStore.dataOffset + 4] & 0xff) << 24));
+        int hour = rowStore.row[rowStore.dataOffset + 5];
         int timeHour = hour + day * 24;
 
         String hourString;
@@ -2968,7 +2995,7 @@ public class MariaSelectResultSet implements ResultSet {
         }
 
         String minuteString;
-        int minutes = rawBytes[6];
+        int minutes = rowStore.row[rowStore.dataOffset + 6];
         if (minutes < 10) {
             minuteString = "0" + minutes;
         } else {
@@ -2976,7 +3003,7 @@ public class MariaSelectResultSet implements ResultSet {
         }
 
         String secondString;
-        int seconds = rawBytes[7];
+        int seconds = rowStore.row[rowStore.dataOffset + 7];
         if (seconds < 10) {
             secondString = "0" + seconds;
         } else {
@@ -2984,18 +3011,18 @@ public class MariaSelectResultSet implements ResultSet {
         }
 
         int microseconds = 0;
-        if (rawBytes.length > 8) {
-            microseconds = ((rawBytes[8] & 0xff)
-                    | (rawBytes[9] & 0xff) << 8
-                    | (rawBytes[10] & 0xff) << 16
-                    | (rawBytes[11] & 0xff) << 24);
+        if (rowStore.dataLength > 8) {
+            microseconds = ((rowStore.row[rowStore.dataOffset + 8] & 0xff)
+                    | (rowStore.row[rowStore.dataOffset + 9] & 0xff) << 8
+                    | (rowStore.row[rowStore.dataOffset + 10] & 0xff) << 16
+                    | (rowStore.row[rowStore.dataOffset + 11] & 0xff) << 24);
         }
 
         String microsecondString = Integer.toString(microseconds);
         while (microsecondString.length() < 6) {
             microsecondString = "0" + microsecondString;
         }
-        boolean negative = (rawBytes[0] == 0x01);
+        boolean negative = (rowStore.row[rowStore.dataOffset] == 0x01);
         return (negative ? "-" : "") + (hourString + ":" + minuteString + ":" + secondString + "." + microsecondString);
     }
 
@@ -3007,51 +3034,51 @@ public class MariaSelectResultSet implements ResultSet {
         }
     }
 
-    private int getTinyInt(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        int value = rawBytes[0];
-        if (!columnInfo.isSigned()) {
-            value = (rawBytes[0] & 0xff);
+    private int getTinyInt(RowStore rowStore) throws SQLException {
+        int value = rowStore.row[rowStore.dataOffset];
+        if (!rowStore.columnInfo.isSigned()) {
+            value = (rowStore.row[rowStore.dataOffset] & 0xff);
         }
         return value;
     }
 
-    private int getSmallInt(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        int value = ((rawBytes[0] & 0xff) + ((rawBytes[1] & 0xff) << 8));
-        if (!columnInfo.isSigned()) {
+    private int getSmallInt(RowStore rowStore) throws SQLException {
+        int value = ((rowStore.row[rowStore.dataOffset] & 0xff) + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8));
+        if (!rowStore.columnInfo.isSigned()) {
             return value & 0xffff;
         }
         //short cast here is important : -1 will be received as -1, -1 -> 65535
         return (short) value;
     }
 
-    private long getMediumInt(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        long value = ((rawBytes[0] & 0xff)
-                + ((rawBytes[1] & 0xff) << 8)
-                + ((rawBytes[2] & 0xff) << 16)
-                + ((rawBytes[3] & 0xff) << 24));
-        if (!columnInfo.isSigned()) {
+    private long getMediumInt(RowStore rowStore) throws SQLException {
+        long value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24));
+        if (!rowStore.columnInfo.isSigned()) {
             value = value & 0xffffffffL;
         }
         return value;
     }
 
 
-    private byte parseByte(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
+    private byte parseByte(RowStore rowStore) throws SQLException {
         try {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case FLOAT:
-                    Float floatValue = Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Float floatValue = Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (floatValue.compareTo((float) Byte.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Byte range", "22003", 1264);
                     }
                     return floatValue.byteValue();
                 case DOUBLE:
-                    Double doubleValue = Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Double doubleValue = Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (doubleValue.compareTo((double) Byte.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Byte range", "22003", 1264);
                     }
                     return doubleValue.byteValue();
@@ -3060,28 +3087,34 @@ public class MariaSelectResultSet implements ResultSet {
                 case YEAR:
                 case INTEGER:
                 case MEDIUMINT:
+                case BIGINT:
                     long result = 0;
-                    int length = rawBytes.length;
                     boolean negate = false;
                     int begin = 0;
-                    if (length > 0 && rawBytes[0] == 45) { //minus sign
+                    if (rowStore.dataLength > 0 && rowStore.row[rowStore.dataOffset] == 45) { //minus sign
                         negate = true;
                         begin = 1;
                     }
-                    for (; begin < length; begin++) {
-                        result = result * 10 + rawBytes[begin] - 48;
+                    for (; begin < rowStore.dataLength; begin++) {
+                        result = result * 10 + rowStore.row[rowStore.dataOffset + begin] - 48;
+                    }
+                    //specific for BIGINT : if value > Long.MAX_VALUE , will become negative until -1
+                    if (result < 0) {
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
+                                + " is not in Byte range", "22003", 1264);
                     }
                     result = (negate ? -1 * result : result);
-                    rangeCheck(Byte.class, Byte.MIN_VALUE, Byte.MAX_VALUE, result, columnInfo);
+                    rangeCheck(Byte.class, Byte.MIN_VALUE, Byte.MAX_VALUE, result, rowStore.columnInfo);
                     return (byte) result;
                 default:
-                    return Byte.parseByte(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Byte.parseByte(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         } catch (NumberFormatException nfe) {
             //parse error.
             //if this is a decimal with only "0" in decimal, like "1.0000" (can be the case if trying to getByte with a database decimal value
             //retrying without the decimal part.
-            String value = new String(rawBytes, StandardCharsets.UTF_8);
+            String value = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             if (isIntegerRegex.matcher(value).find()) {
                 try {
                     return Byte.parseByte(value.substring(0, value.indexOf(".")));
@@ -3089,28 +3122,28 @@ public class MariaSelectResultSet implements ResultSet {
                     //eat exception
                 }
             }
-            throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + value
+            throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + value
                     + " is not in Byte range",
                     "22003", 1264);
         }
     }
 
-    private short parseShort(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
+    private short parseShort(RowStore rowStore) throws SQLException {
         try {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case FLOAT:
-                    Float floatValue = Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Float floatValue = Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (floatValue.compareTo((float) Short.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Short range", "22003", 1264);
                     }
                     return floatValue.shortValue();
                 case DOUBLE:
-                    Double doubleValue = Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Double doubleValue = Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (doubleValue.compareTo((double) Short.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Short range", "22003", 1264);
                     }
                     return doubleValue.shortValue();
@@ -3120,28 +3153,34 @@ public class MariaSelectResultSet implements ResultSet {
                 case YEAR:
                 case INTEGER:
                 case MEDIUMINT:
+                case BIGINT:
                     long result = 0;
-                    int length = rawBytes.length;
                     boolean negate = false;
                     int begin = 0;
-                    if (length > 0 && rawBytes[0] == 45) { //minus sign
+                    if (rowStore.dataLength > 0 && rowStore.row[rowStore.dataOffset] == 45) { //minus sign
                         negate = true;
                         begin = 1;
                     }
-                    for (; begin < length; begin++) {
-                        result = result * 10 + rawBytes[begin] - 48;
+                    for (; begin < rowStore.dataLength; begin++) {
+                        result = result * 10 + rowStore.row[rowStore.dataOffset + begin] - 48;
+                    }
+                    //specific for BIGINT : if value > Long.MAX_VALUE , will become negative until -1
+                    if (result < 0) {
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
+                                + " is not in Short range", "22003", 1264);
                     }
                     result = (negate ? -1 * result : result);
-                    rangeCheck(Short.class, Short.MIN_VALUE, Short.MAX_VALUE, result, columnInfo);
+                    rangeCheck(Short.class, Short.MIN_VALUE, Short.MAX_VALUE, result, rowStore.columnInfo);
                     return (short) result;
                 default:
-                    return Short.parseShort(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Short.parseShort(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         } catch (NumberFormatException nfe) {
             //parse error.
             //if this is a decimal with only "0" in decimal, like "1.0000" (can be the case if trying to getInt with a database decimal value
             //retrying without the decimal part.
-            String value = new String(rawBytes, StandardCharsets.UTF_8);
+            String value = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             if (isIntegerRegex.matcher(value).find()) {
                 try {
                     return Short.parseShort(value.substring(0, value.indexOf(".")));
@@ -3149,28 +3188,28 @@ public class MariaSelectResultSet implements ResultSet {
                     //eat exception
                 }
             }
-            throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + value
+            throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + value
                     + " is not in Short range", "22003", 1264);
         }
     }
 
 
-    private int parseInt(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
+    private int parseInt(RowStore rowStore) throws SQLException {
         try {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case FLOAT:
-                    Float floatValue = Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Float floatValue = Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (floatValue.compareTo((float) Integer.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Integer range", "22003", 1264);
                     }
                     return floatValue.intValue();
                 case DOUBLE:
-                    Double doubleValue = Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Double doubleValue = Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (doubleValue.compareTo((double) Integer.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Integer range", "22003", 1264);
                     }
                     return doubleValue.intValue();
@@ -3180,28 +3219,34 @@ public class MariaSelectResultSet implements ResultSet {
                 case YEAR:
                 case INTEGER:
                 case MEDIUMINT:
+                case BIGINT:
                     long result = 0;
-                    int length = rawBytes.length;
                     boolean negate = false;
                     int begin = 0;
-                    if (length > 0 && rawBytes[0] == 45) { //minus sign
+                    if (rowStore.dataLength > 0 && rowStore.row[rowStore.dataOffset] == 45) { //minus sign
                         negate = true;
                         begin = 1;
                     }
-                    for (; begin < length; begin++) {
-                        result = result * 10 + rawBytes[begin] - 48;
+                    for (; begin < rowStore.dataLength; begin++) {
+                        result = result * 10 + rowStore.row[rowStore.dataOffset + begin] - 48;
+                    }
+                    //specific for BIGINT : if value > Long.MAX_VALUE will become negative.
+                    if (result < 0) {
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
+                                + " is not in Integer range", "22003", 1264);
                     }
                     result = (negate ? -1 * result : result);
-                    rangeCheck(Integer.class, Integer.MIN_VALUE, Integer.MAX_VALUE, result, columnInfo);
+                    rangeCheck(Integer.class, Integer.MIN_VALUE, Integer.MAX_VALUE, result, rowStore.columnInfo);
                     return (int) result;
                 default:
-                    return Integer.parseInt(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Integer.parseInt(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         } catch (NumberFormatException nfe) {
             //parse error.
             //if this is a decimal with only "0" in decimal, like "1.0000" (can be the case if trying to getInt with a database decimal value
             //retrying without the decimal part.
-            String value = new String(rawBytes, StandardCharsets.UTF_8);
+            String value = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             if (isIntegerRegex.matcher(value).find()) {
                 try {
                     return Integer.parseInt(value.substring(0, value.indexOf(".")));
@@ -3209,27 +3254,27 @@ public class MariaSelectResultSet implements ResultSet {
                     //eat exception
                 }
             }
-            throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + value
+            throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + value
                     + " is not in Integer range", "22003", 1264);
         }
     }
 
-    private long parseLong(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
+    private long parseLong(RowStore rowStore) throws SQLException {
         try {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case FLOAT:
-                    Float floatValue = Float.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Float floatValue = Float.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (floatValue.compareTo((float) Long.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Long range", "22003", 1264);
                     }
                     return floatValue.longValue();
                 case DOUBLE:
-                    Double doubleValue = Double.valueOf(new String(rawBytes, StandardCharsets.UTF_8));
+                    Double doubleValue = Double.valueOf(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
                     if (doubleValue.compareTo((double) Long.MAX_VALUE) >= 1) {
-                        throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value "
-                                + new String(rawBytes, StandardCharsets.UTF_8)
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
                                 + " is not in Long range", "22003", 1264);
                     }
                     return doubleValue.longValue();
@@ -3239,27 +3284,33 @@ public class MariaSelectResultSet implements ResultSet {
                 case YEAR:
                 case INTEGER:
                 case MEDIUMINT:
+                case BIGINT:
                     long result = 0;
-                    int length = rawBytes.length;
                     boolean negate = false;
                     int begin = 0;
-                    if (length > 0 && rawBytes[0] == 45) { //minus sign
+                    if (rowStore.dataLength > 0 && rowStore.row[rowStore.dataOffset] == 45) { //minus sign
                         negate = true;
                         begin = 1;
                     }
-                    for (; begin < length; begin++) {
-                        result = result * 10 + rawBytes[begin] - 48;
+                    for (; begin < rowStore.dataLength; begin++) {
+                        result = result * 10 + rowStore.row[rowStore.dataOffset + begin] - 48;
+                    }
+                    //specific for BIGINT : if value > Long.MAX_VALUE , will become negative until -1
+                    if (result < 0) {
+                        throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value "
+                                + new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8)
+                                + " is not in Long range", "22003", 1264);
                     }
                     return (negate ? -1 * result : result);
                 default:
-                    return Long.parseLong(new String(rawBytes, StandardCharsets.UTF_8));
+                    return Long.parseLong(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
 
         } catch (NumberFormatException nfe) {
             //parse error.
             //if this is a decimal with only "0" in decimal, like "1.0000" (can be the case if trying to getlong with a database decimal value
             //retrying without the decimal part.
-            String value = new String(rawBytes, StandardCharsets.UTF_8);
+            String value = new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8);
             if (isIntegerRegex.matcher(value).find()) {
                 try {
                     return Long.parseLong(value.substring(0, value.indexOf(".")));
@@ -3267,7 +3318,7 @@ public class MariaSelectResultSet implements ResultSet {
                     //eat exception
                 }
             }
-            throw new SQLException("Out of range value for column '" + columnInfo.getName() + "' : value " + value
+            throw new SQLException("Out of range value for column '" + rowStore.columnInfo.getName() + "' : value " + value
                     + " is not in Long range", "22003", 1264);
         }
     }
@@ -3275,45 +3326,44 @@ public class MariaSelectResultSet implements ResultSet {
     /**
      * Get BigInteger from raw data.
      *
-     * @param rawBytes   bytes
-     * @param columnInfo current column information
+     * @param rowStore object that store data byte infos
      * @return bigInteger
      * @throws SQLException exception
      */
-    private BigInteger getBigInteger(byte[] rawBytes, ColumnInformation columnInfo) throws SQLException {
-        if (rawBytes == null) {
-            return null;
-        }
+    private BigInteger getBigInteger(RowStore rowStore) throws SQLException {
+        if (rowStore == null || rowStore.dataLength == 0) return null;
+
         if (!this.isBinaryEncoded) {
-            return new BigInteger(new String(rawBytes, StandardCharsets.UTF_8));
+            return new BigInteger(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
         } else {
-            switch (columnInfo.getType()) {
+            switch (rowStore.columnInfo.getType()) {
                 case BIT:
-                    return BigInteger.valueOf((long) rawBytes[0]);
+                    return BigInteger.valueOf((long) rowStore.row[rowStore.dataOffset]);
                 case TINYINT:
-                    return BigInteger.valueOf((long) (columnInfo.isSigned() ? rawBytes[0] : (rawBytes[0] & 0xff)));
+                    return BigInteger.valueOf((long)
+                            (rowStore.columnInfo.isSigned() ? rowStore.row[rowStore.dataOffset] : (rowStore.row[rowStore.dataOffset] & 0xff)));
                 case SMALLINT:
                 case YEAR:
-                    short valueShort = (short) ((rawBytes[0] & 0xff) | ((rawBytes[1] & 0xff) << 8));
-                    return BigInteger.valueOf((long) (columnInfo.isSigned() ? valueShort : (valueShort & 0xffff)));
+                    short valueShort = (short) ((rowStore.row[rowStore.dataOffset] & 0xff) | ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8));
+                    return BigInteger.valueOf((long) (rowStore.columnInfo.isSigned() ? valueShort : (valueShort & 0xffff)));
                 case INTEGER:
                 case MEDIUMINT:
-                    int valueInt = ((rawBytes[0] & 0xff)
-                            + ((rawBytes[1] & 0xff) << 8)
-                            + ((rawBytes[2] & 0xff) << 16)
-                            + ((rawBytes[3] & 0xff) << 24));
-                    return BigInteger.valueOf(((columnInfo.isSigned()) ? valueInt : (valueInt >= 0) ? valueInt : valueInt & 0xffffffffL));
+                    int valueInt = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24));
+                    return BigInteger.valueOf(((rowStore.columnInfo.isSigned()) ? valueInt : (valueInt >= 0) ? valueInt : valueInt & 0xffffffffL));
                 case BIGINT:
-                    long value = ((rawBytes[0] & 0xff)
-                            + ((long) (rawBytes[1] & 0xff) << 8)
-                            + ((long) (rawBytes[2] & 0xff) << 16)
-                            + ((long) (rawBytes[3] & 0xff) << 24)
-                            + ((long) (rawBytes[4] & 0xff) << 32)
-                            + ((long) (rawBytes[5] & 0xff) << 40)
-                            + ((long) (rawBytes[6] & 0xff) << 48)
-                            + ((long) (rawBytes[7] & 0xff) << 56)
+                    long value = ((rowStore.row[rowStore.dataOffset] & 0xff)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 2] & 0xff) << 16)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 3] & 0xff) << 24)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 4] & 0xff) << 32)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 5] & 0xff) << 40)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 6] & 0xff) << 48)
+                            + ((long) (rowStore.row[rowStore.dataOffset + 7] & 0xff) << 56)
                     );
-                    if (columnInfo.isSigned()) {
+                    if (rowStore.columnInfo.isSigned()) {
                         return BigInteger.valueOf(value);
                     } else {
                         return new BigInteger(1, new byte[]{(byte) (value >> 56),
@@ -3322,31 +3372,29 @@ public class MariaSelectResultSet implements ResultSet {
                                 (byte) (value >> 0)});
                     }
                 case FLOAT:
-                    return BigInteger.valueOf((long) getFloat(rawBytes, columnInfo));
+                    return BigInteger.valueOf((long) getFloat(rowStore));
                 case DOUBLE:
-                    return BigInteger.valueOf((long) getDouble(rawBytes, columnInfo));
+                    return BigInteger.valueOf((long) getDouble(rowStore));
                 default:
-                    return new BigInteger(new String(rawBytes, StandardCharsets.UTF_8));
+                    return new BigInteger(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8));
             }
         }
 
     }
 
 
-    private Date binaryDate(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        switch (columnInfo.getType()) {
+    private Date binaryDate(RowStore rowStore, Calendar cal) throws ParseException {
+        switch (rowStore.columnInfo.getType()) {
             case TIMESTAMP:
             case DATETIME:
-                Timestamp timestamp = getTimestamp(rawBytes, columnInfo, cal);
+                Timestamp timestamp = getTimestamp(rowStore, cal);
                 return (timestamp == null) ? null : new Date(timestamp.getTime());
             default:
-                if (rawBytes.length == 0) {
-                    return null;
-                }
+                if (rowStore.dataLength == 0) return null;
 
-                int year = ((rawBytes[0] & 0xff) | (rawBytes[1] & 0xff) << 8);
+                int year = ((rowStore.row[rowStore.dataOffset] & 0xff) | (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8);
 
-                if (rawBytes.length == 2 && columnInfo.getLength() == 2) {
+                if (rowStore.dataLength == 2 && rowStore.columnInfo.getLength() == 2) {
                     //YEAR(2) - deprecated
                     if (year <= 69) {
                         year += 2000;
@@ -3358,9 +3406,9 @@ public class MariaSelectResultSet implements ResultSet {
                 int month = 1;
                 int day = 1;
 
-                if (rawBytes.length >= 4) {
-                    month = rawBytes[2];
-                    day = rawBytes[3];
+                if (rowStore.dataLength >= 4) {
+                    month = rowStore.row[rowStore.dataOffset + 2];
+                    day = rowStore.row[rowStore.dataOffset + 3];
                 }
 
                 Calendar calendar = Calendar.getInstance();
@@ -3381,11 +3429,11 @@ public class MariaSelectResultSet implements ResultSet {
         }
     }
 
-    private Time binaryTime(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        switch (columnInfo.getType()) {
+    private Time binaryTime(RowStore rowStore, Calendar cal) throws ParseException {
+        switch (rowStore.columnInfo.getType()) {
             case TIMESTAMP:
             case DATETIME:
-                Timestamp ts = binaryTimestamp(rawBytes, columnInfo, cal);
+                Timestamp ts = binaryTimestamp(rowStore, cal);
                 return (ts == null) ? null : new Time(ts.getTime());
             case DATE:
                 Calendar tmpCalendar = Calendar.getInstance();
@@ -3401,28 +3449,28 @@ public class MariaSelectResultSet implements ResultSet {
                 int minutes = 0;
                 int seconds = 0;
                 boolean negate = false;
-                if (rawBytes.length > 0) {
-                    negate = (rawBytes[0] & 0xff) == 0x01;
+                if (rowStore.dataLength > 0) {
+                    negate = (rowStore.row[rowStore.dataOffset] & 0xff) == 0x01;
                 }
-                if (rawBytes.length > 4) {
-                    day = ((rawBytes[1] & 0xff)
-                            + ((rawBytes[2] & 0xff) << 8)
-                            + ((rawBytes[3] & 0xff) << 16)
-                            + ((rawBytes[4] & 0xff) << 24));
+                if (rowStore.dataLength > 4) {
+                    day = ((rowStore.row[rowStore.dataOffset + 1] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 4] & 0xff) << 24));
                 }
-                if (rawBytes.length > 7) {
-                    hour = rawBytes[5];
-                    minutes = rawBytes[6];
-                    seconds = rawBytes[7];
+                if (rowStore.dataLength > 7) {
+                    hour = rowStore.row[rowStore.dataOffset + 5];
+                    minutes = rowStore.row[rowStore.dataOffset + 6];
+                    seconds = rowStore.row[rowStore.dataOffset + 7];
                 }
                 calendar.set(1970, 0, ((negate ? -1 : 1) * day) + 1, (negate ? -1 : 1) * hour, minutes, seconds);
 
                 int nanoseconds = 0;
-                if (rawBytes.length > 8) {
-                    nanoseconds = ((rawBytes[8] & 0xff)
-                            + ((rawBytes[9] & 0xff) << 8)
-                            + ((rawBytes[10] & 0xff) << 16)
-                            + ((rawBytes[11] & 0xff) << 24));
+                if (rowStore.dataLength > 8) {
+                    nanoseconds = ((rowStore.row[rowStore.dataOffset + 8] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 9] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 10] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 11] & 0xff) << 24));
                 }
 
                 calendar.set(Calendar.MILLISECOND, nanoseconds / 1000);
@@ -3432,10 +3480,9 @@ public class MariaSelectResultSet implements ResultSet {
     }
 
 
-    private Timestamp binaryTimestamp(byte[] rawBytes, ColumnInformation columnInfo, Calendar cal) throws ParseException {
-        if (rawBytes.length == 0) {
-            return null;
-        }
+    private Timestamp binaryTimestamp(RowStore rowStore, Calendar cal) throws ParseException {
+        if (rowStore == null || rowStore.dataLength == 0) return null;
+
         int year;
         int month;
         int day = 0;
@@ -3444,31 +3491,31 @@ public class MariaSelectResultSet implements ResultSet {
         int seconds = 0;
         int microseconds = 0;
 
-        if (columnInfo.getType() == MariaDbType.TIME) {
+        if (rowStore.columnInfo.getType() == MariaDbType.TIME) {
             Calendar calendar = Calendar.getInstance();
             calendar.clear();
 
             boolean negate = false;
-            if (rawBytes.length > 0) {
-                negate = (rawBytes[0] & 0xff) == 0x01;
+            if (rowStore.dataLength > 0) {
+                negate = (rowStore.row[rowStore.dataOffset] & 0xff) == 0x01;
             }
-            if (rawBytes.length > 4) {
-                day = ((rawBytes[1] & 0xff)
-                        + ((rawBytes[2] & 0xff) << 8)
-                        + ((rawBytes[3] & 0xff) << 16)
-                        + ((rawBytes[4] & 0xff) << 24));
+            if (rowStore.dataLength > 4) {
+                day = ((rowStore.row[rowStore.dataOffset + 1] & 0xff)
+                        + ((rowStore.row[rowStore.dataOffset + 2] & 0xff) << 8)
+                        + ((rowStore.row[rowStore.dataOffset + 3] & 0xff) << 16)
+                        + ((rowStore.row[rowStore.dataOffset + 4] & 0xff) << 24));
             }
-            if (rawBytes.length > 7) {
-                hour = rawBytes[5];
-                minutes = rawBytes[6];
-                seconds = rawBytes[7];
+            if (rowStore.dataLength > 7) {
+                hour = rowStore.row[rowStore.dataOffset + 5];
+                minutes = rowStore.row[rowStore.dataOffset + 6];
+                seconds = rowStore.row[rowStore.dataOffset + 7];
             }
 
-            if (rawBytes.length > 8) {
-                microseconds = ((rawBytes[8] & 0xff)
-                        + ((rawBytes[9] & 0xff) << 8)
-                        + ((rawBytes[10] & 0xff) << 16)
-                        + ((rawBytes[11] & 0xff) << 24));
+            if (rowStore.dataLength > 8) {
+                microseconds = ((rowStore.row[rowStore.dataOffset + 8] & 0xff)
+                        + ((rowStore.row[rowStore.dataOffset + 9] & 0xff) << 8)
+                        + ((rowStore.row[rowStore.dataOffset + 10] & 0xff) << 16)
+                        + ((rowStore.row[rowStore.dataOffset + 11] & 0xff) << 24));
             }
 
             calendar.set(1970, 0, ((negate ? -1 : 1) * day) + 1, (negate ? -1 : 1) * hour, minutes, seconds);
@@ -3476,19 +3523,19 @@ public class MariaSelectResultSet implements ResultSet {
             tt.setNanos(microseconds * 1000);
             return tt;
         } else {
-            year = ((rawBytes[0] & 0xff) | (rawBytes[1] & 0xff) << 8);
-            month = rawBytes[2];
-            day = rawBytes[3];
-            if (rawBytes.length > 4) {
-                hour = rawBytes[4];
-                minutes = rawBytes[5];
-                seconds = rawBytes[6];
+            year = ((rowStore.row[rowStore.dataOffset] & 0xff) | (rowStore.row[rowStore.dataOffset + 1] & 0xff) << 8);
+            month = rowStore.row[rowStore.dataOffset + 2];
+            day = rowStore.row[rowStore.dataOffset + 3];
+            if (rowStore.dataLength > 4) {
+                hour = rowStore.row[rowStore.dataOffset + 4];
+                minutes = rowStore.row[rowStore.dataOffset + 5];
+                seconds = rowStore.row[rowStore.dataOffset + 6];
 
-                if (rawBytes.length > 7) {
-                    microseconds = ((rawBytes[7] & 0xff)
-                            + ((rawBytes[8] & 0xff) << 8)
-                            + ((rawBytes[9] & 0xff) << 16)
-                            + ((rawBytes[10] & 0xff) << 24));
+                if (rowStore.dataLength > 7) {
+                    microseconds = ((rowStore.row[rowStore.dataOffset + 7] & 0xff)
+                            + ((rowStore.row[rowStore.dataOffset + 8] & 0xff) << 8)
+                            + ((rowStore.row[rowStore.dataOffset + 9] & 0xff) << 16)
+                            + ((rowStore.row[rowStore.dataOffset + 10] & 0xff) << 24));
                 }
             }
         }
@@ -3528,34 +3575,12 @@ public class MariaSelectResultSet implements ResultSet {
 
     /**
      * Get inputStream value from raw data.
-     * @param rawBytes rowdata
+     * @param rowStore object that store data byte infos
      * @return inputStream
      */
-    public InputStream getInputStream(byte[] rawBytes) {
-        if (rawBytes == null) {
-            return null;
-        }
-        return new ByteArrayInputStream(new String(rawBytes, StandardCharsets.UTF_8).getBytes());
+    public InputStream getInputStream(RowStore rowStore) {
+        if (rowStore == null) return null;
+        return new ByteArrayInputStream(new String(rowStore.row, rowStore.dataOffset, rowStore.dataLength, StandardCharsets.UTF_8).getBytes());
     }
-
-    static final String zeroTimestamp = "0000-00-00 00:00:00";
-    static final String zeroDate = "0000-00-00";
-
-    /**
-     * Is data null.
-     *
-     * @param rawBytes bytes
-     * @param dataType field datatype
-     * @return true if data is null
-     */
-    private boolean isNull(byte[] rawBytes, MariaDbType dataType) {
-        return (rawBytes == null
-                || (isBinaryEncoded && ((dataType == MariaDbType.DATE || dataType == MariaDbType.TIMESTAMP || dataType == MariaDbType.DATETIME)
-                && rawBytes.length == 0))
-                || (!isBinaryEncoded && ((dataType == MariaDbType.TIMESTAMP || dataType == MariaDbType.DATETIME)
-                && zeroTimestamp.equals(new String(rawBytes, StandardCharsets.UTF_8))))
-                || (!isBinaryEncoded && (dataType == MariaDbType.DATE && zeroDate.equals(new String(rawBytes, StandardCharsets.UTF_8)))));
-    }
-
 
 }

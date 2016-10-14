@@ -358,9 +358,10 @@ public class PacketOutputStream extends OutputStream {
     /**
      * Ending command that tell to send buffer to server.
      * @param logQuery log query (password mustn't be logged)
+     * @return true if packet has been send.
      * @throws IOException if any connection error occur
      */
-    public void finishPacketWithoutRelease(boolean logQuery) throws IOException {
+    public boolean finishPacketWithoutRelease(boolean logQuery) throws IOException {
         if (buffer.position() > 4) {
             checkPacketMaxSize(buffer.position() - 4);
 
@@ -369,8 +370,10 @@ public class PacketOutputStream extends OutputStream {
             } else {
                 generatePacket(logQuery);
             }
+            this.lastSeq =  (useCompression) ? this.compressSeqNo : this.seqNo;
+            return true;
         }
-        this.lastSeq =  (useCompression) ? this.compressSeqNo : this.seqNo;
+        return false;
     }
 
     /**

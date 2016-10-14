@@ -839,10 +839,6 @@ public class MultiTest extends BaseTest {
 
     private void continueOnBatchError(boolean continueBatch, boolean serverPrepare,
                                       boolean rewrite, boolean batchMulti) throws SQLException {
-        System.out.println("continueBatch:" + continueBatch
-                + " serverPrepare:" + serverPrepare
-                + " rewrite:" + rewrite
-                + " batchMulti:" + batchMulti);
         createTable("MultiTestt9", "id int not null primary key, test varchar(10)");
         try (Connection connection = setBlankConnection(
                 "&useServerPrepStmts=" + serverPrepare

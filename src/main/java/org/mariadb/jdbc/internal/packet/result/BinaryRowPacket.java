@@ -51,6 +51,7 @@ package org.mariadb.jdbc.internal.packet.result;
 
 import org.mariadb.jdbc.internal.packet.dao.ColumnInformation;
 import org.mariadb.jdbc.internal.packet.read.ReadPacketFetcher;
+import org.mariadb.jdbc.internal.queryresults.resultset.RowStore;
 import org.mariadb.jdbc.internal.stream.MariaDbInputStream;
 import org.mariadb.jdbc.internal.util.buffer.Buffer;
 
@@ -74,135 +75,31 @@ public class BinaryRowPacket implements RowPacket {
     }
 
     /**
-     * Fetch stream to retrieve data. Data length is unknown.
+     * Read value corresponding to a column number from row.
      *
-     * @param buffer        buffer
-     * @param packetFetcher packetFetcher
-     * @return next field length
-     * @throws IOException if a connection error occur
+     * @param row current row bytes
+     * @param column column number ( first is 0)
+     * @param columnInfo column informations
+     * @param initColumn last query column for faster access
+     * @param initPosition last query row position for faster access
+     * @return rowStore indicating data bytes, or null if data is null
      */
-    public long appendPacketIfNeeded(Buffer buffer, ReadPacketFetcher packetFetcher) throws IOException {
-        long encLength = buffer.getLengthEncodedBinary();
-        while (encLength > buffer.remaining()) {
-            buffer.appendPacket(packetFetcher.getPacket());
-        }
-        return encLength;
-    }
+    public RowStore getOffsetAndLength(byte[] row, int column, ColumnInformation columnInfo, int initColumn, int initPosition) {
 
-    /**
-     * Fetch stream to retrieve data. Data length is known.
-     *
-     * @param buffer        reader
-     * @param packetFetcher packetFetcher
-     * @param encLength     data binary length
-     * @throws IOException if a connection error occur
-     */
-    public void appendPacketIfNeeded(Buffer buffer, ReadPacketFetcher packetFetcher, long encLength) throws IOException {
-        while (encLength > buffer.remaining()) {
-            buffer.appendPacket(packetFetcher.getPacket());
-        }
-    }
-
-    /**
-     * Get next row data.
-     *
-     * @param packetFetcher packetFetcher
-     * @param buffer        current buffer
-     * @return read data
-     * @throws IOException if any connection error occur
-     */
-    public byte[][] getRow(ReadPacketFetcher packetFetcher, Buffer buffer) throws IOException {
-        byte[][] valueObjects = new byte[columnInformationLength][];
-        buffer.skipByte(); //stream header
-        int nullCount = (columnInformationLength + 9) / 8;
-        byte[] nullBitsBuffer = buffer.readRawBytes(nullCount);
-
-        for (int i = 0; i < columnInformationLength; i++) {
-            if ((nullBitsBuffer[(i + 2) / 8] & (1 << ((i + 2) % 8))) > 0) {
-                //field is null
-                valueObjects[i] = null;
-            } else {
-                switch (columnInformation[i].getType()) {
-                    case VARCHAR:
-                    case BIT:
-                    case ENUM:
-                    case SET:
-                    case TINYBLOB:
-                    case MEDIUMBLOB:
-                    case LONGBLOB:
-                    case BLOB:
-                    case VARSTRING:
-                    case STRING:
-                    case GEOMETRY:
-                    case OLDDECIMAL:
-                    case DECIMAL:
-                    case TIME:
-                    case DATE:
-                    case DATETIME:
-                    case TIMESTAMP:
-                        long length = appendPacketIfNeeded(buffer, packetFetcher);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(length);
-                        break;
-
-                    case BIGINT:
-                        appendPacketIfNeeded(buffer, packetFetcher, 8);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(8);
-                        break;
-
-                    case INTEGER:
-                    case MEDIUMINT:
-                        appendPacketIfNeeded(buffer, packetFetcher, 4);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(4);
-                        break;
-
-                    case SMALLINT:
-                    case YEAR:
-                        appendPacketIfNeeded(buffer, packetFetcher, 2);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(2);
-                        break;
-
-                    case TINYINT:
-                        appendPacketIfNeeded(buffer, packetFetcher, 1);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(1);
-                        break;
-
-                    case DOUBLE:
-                        appendPacketIfNeeded(buffer, packetFetcher, 8);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(8);
-                        break;
-
-                    case FLOAT:
-                        appendPacketIfNeeded(buffer, packetFetcher, 4);
-                        valueObjects[i] = buffer.getLengthEncodedBytesWithLength(4);
-                        break;
-                    default:
-                        appendPacketIfNeeded(buffer, packetFetcher);
-                        valueObjects[i] = null;
-                        break;
-                }
-            }
-        }
-        return valueObjects;
-    }
-
-    /**
-     * Read text row stream. (to fetch Resulset.next() datas)
-     *
-     * @param packetFetcher packetFetcher
-     * @param inputStream inputStream
-     * @return datas object
-     * @throws IOException if any connection error occur
-     */
-    public byte[][] getRow(ReadPacketFetcher packetFetcher, MariaDbInputStream inputStream, int remaining, int read) throws IOException {
-        byte[][] valueObjects = new byte[columnInformationLength][];
         int toReadLen;
+        int position = 1;
         int nullCount = (columnInformationLength + 9) / 8;
-        byte[] nullBitsBuffer = packetFetcher.readLength(nullCount);
-        remaining -= nullCount;
-        for (int i = 0; i < columnInformationLength; i++) {
+        byte[] nullBitsBuffer = new byte[nullCount];
+        for (int i = 0; i < nullCount; i++) {
+            nullBitsBuffer[i] = row[position++];
+        }
+
+        if (initPosition != 0) position = initPosition;
+
+        for (int i = initColumn; i < columnInformationLength; i++) {
             if ((nullBitsBuffer[(i + 2) / 8] & (1 << ((i + 2) % 8))) > 0) {
                 //field is null
-                valueObjects[i] = null;
+                if (i == column) return null;
             } else {
                 switch (columnInformation[i].getType()) {
                     case VARCHAR:
@@ -222,75 +119,84 @@ public class BinaryRowPacket implements RowPacket {
                     case DATE:
                     case DATETIME:
                     case TIMESTAMP:
-                        read = inputStream.read() & 0xff;
-                        remaining -= 1;
+                        int read = row[position++] & 0xff;
                         switch (read) {
                             case 251:
-                                toReadLen = -1;
+                                if (i == column) return null;
                                 break;
                             case 252:
-                                toReadLen = ((inputStream.read() & 0xff) + ((inputStream.read() & 0xff) << 8));
-                                remaining -= 2;
+                                toReadLen = ((row[position++] & 0xff) + ((row[position++] & 0xff) << 8));
+                                if (i == column) {
+                                    return new RowStore(row, position, toReadLen, columnInfo, column);
+                                } else {
+                                    position += toReadLen;
+                                }
                                 break;
                             case 253:
-                                toReadLen = (inputStream.read() & 0xff)
-                                        + ((inputStream.read() & 0xff) << 8)
-                                        + ((inputStream.read() & 0xff) << 16);
-                                remaining -= 3;
+                                toReadLen = (row[position++] & 0xff)
+                                        + ((row[position++] & 0xff) << 8)
+                                        + ((row[position++] & 0xff) << 16);
+                                if (i == column) {
+                                    return new RowStore(row, position, toReadLen, columnInfo, column);
+                                } else {
+                                    position += toReadLen;
+                                }
                                 break;
                             case 254:
-                                toReadLen = (int) (((inputStream.read() & 0xff)
-                                        + ((long) (inputStream.read() & 0xff) << 8)
-                                        + ((long) (inputStream.read() & 0xff) << 16)
-                                        + ((long) (inputStream.read() & 0xff) << 24)
-                                        + ((long) (inputStream.read() & 0xff) << 32)
-                                        + ((long) (inputStream.read() & 0xff) << 40)
-                                        + ((long) (inputStream.read() & 0xff) << 48)
-                                        + ((long) (inputStream.read() & 0xff) << 56)));
-                                remaining -= 8;
+                                toReadLen = (int) (((row[position++] & 0xff)
+                                        + ((long) (row[position++] & 0xff) << 8)
+                                        + ((long) (row[position++] & 0xff) << 16)
+                                        + ((long) (row[position++] & 0xff) << 24)
+                                        + ((long) (row[position++] & 0xff) << 32)
+                                        + ((long) (row[position++] & 0xff) << 40)
+                                        + ((long) (row[position++] & 0xff) << 48)
+                                        + ((long) (row[position++] & 0xff) << 56)));
+                                if (i == column) {
+                                    return new RowStore(row, position, toReadLen, columnInfo, column);
+                                } else {
+                                    position += toReadLen;
+                                }
                                 break;
                             default:
-                                toReadLen = read;
-                        }
-                        if (toReadLen == -1) {
-                            valueObjects[i] = null;
-                        } else if (toReadLen == 0) {
-                            valueObjects[i] = new byte[0];
-                        } else {
-                            valueObjects[i] = packetFetcher.readLength(toReadLen);
-                            remaining -= toReadLen;
+                                if (i == column) {
+                                    return new RowStore(row, position, read, columnInfo, column);
+                                } else {
+                                    position += read;
+                                }
                         }
                         break;
 
                     case BIGINT:
                     case DOUBLE:
-                        valueObjects[i] = packetFetcher.readLength(8);
-                        remaining -= 8;
+                        if (i == column) return new RowStore(row, position, 8, columnInfo, column);
+                        position += 8;
                         break;
 
                     case INTEGER:
                     case MEDIUMINT:
                     case FLOAT:
-                        valueObjects[i] = packetFetcher.readLength(4);
-                        remaining -= 4;
+                        if (i == column) return new RowStore(row, position, 4, columnInfo, column);
+                        position += 4;
                         break;
 
                     case SMALLINT:
                     case YEAR:
-                        valueObjects[i] = packetFetcher.readLength(2);
-                        remaining -= 2;
+                        if (i == column) return new RowStore(row, position, 2, columnInfo, column);
+                        position += 2;
                         break;
 
                     case TINYINT:
-                        valueObjects[i] = new byte[]{(byte) inputStream.read()};
-                        remaining -= 1;
+                        if (i == column) return new RowStore(row, position, 1, columnInfo, column);
+                        position += 1;
                         break;
                     default:
-                        valueObjects[i] = null;
+                        if (i == column) return null;
                         break;
                 }
             }
         }
-        return valueObjects;
+
+        return null;
     }
+
 }

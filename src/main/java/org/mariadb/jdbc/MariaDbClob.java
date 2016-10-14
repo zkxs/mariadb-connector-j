@@ -63,6 +63,10 @@ public class MariaDbClob extends MariaDbBlob implements Clob, NClob, Serializabl
         super(bytes);
     }
 
+    public MariaDbClob(byte[] bytes, int offset, int length) {
+        super(bytes, offset, length);
+    }
+
     public MariaDbClob() {
         super();
     }
@@ -73,7 +77,7 @@ public class MariaDbClob extends MariaDbBlob implements Clob, NClob, Serializabl
      */
     public String toString() {
         try {
-            return new String(blobContent, StandardCharsets.UTF_8);
+            return new String(blobContent, offset, length, StandardCharsets.UTF_8);
         } catch (Exception e) {
             throw new AssertionError(e);
         }
@@ -185,7 +189,7 @@ public class MariaDbClob extends MariaDbBlob implements Clob, NClob, Serializabl
     @Override
     public long length() {
         long len = 0;
-        for (int i = 0; i < actualSize; ) {
+        for (int i = 0; i < length; ) {
             int content = blobContent[i] & 0xff;
             if (content < 0x80) {
                 i += 1;

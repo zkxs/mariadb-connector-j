@@ -59,7 +59,7 @@ public class DatatypeTest extends BaseTest {
             if (!clazz.equals(obj.getClass())) {
                 System.out.println("test");
             }
-            assertEquals("Unexpected class for column " + column, clazz, resultSet.getObject(column).getClass());
+            assertEquals("Unexpected class for column " + column, clazz, obj.getClass());
         }
         assertEquals("Unexpected class name for column " + column, clazz.getName(),
                 resultSet.getMetaData().getColumnClassName(index));

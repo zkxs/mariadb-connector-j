@@ -128,6 +128,103 @@ public class ReadPacketFetcher {
     }
 
     /**
+     * Get buffer packet.
+     *
+     * @param reusableBuffer buffer that can be re-used
+     * @return Buffer the buffer
+     * @throws IOException if any
+     */
+    public byte[] getRawPacket(byte[] reusableBuffer) throws IOException {
+        int remaining = 4;
+        int off = 0;
+        do {
+            int count = inputStream.read(headerBuffer, off, remaining);
+            if (count <= 0) {
+                throw new EOFException("unexpected end of stream, read " + (4 - remaining) + " bytes from " + 4);
+            }
+            remaining -= count;
+            off += count;
+        } while (remaining > 0);
+        inputStream.setLastPacketSeq(headerBuffer[3]);
+
+        int length = (headerBuffer[0] & 0xff) + ((headerBuffer[1] & 0xff) << 8) + ((headerBuffer[2] & 0xff) << 16);
+        if (length == 0x00ffffff) {
+            //is multi-packet
+            byte[] currentBytes = (length > 8 && reusableBuffer != null && reusableBuffer.length >= length) ? reusableBuffer : new byte[length];
+            remaining = length;
+            off = 0;
+            do {
+                int count = inputStream.read(currentBytes, off, remaining);
+                if (count < 0) {
+                    throw new EOFException("unexpected end of stream, read " + (length - remaining) + " bytes from " + length);
+                }
+                remaining -= count;
+                off += count;
+            } while (remaining > 0);
+
+            if (logger.isTraceEnabled()) {
+                logger.trace("read packet seq:" + inputStream.getLastPacketSeq() + " length:" + length + " data:"
+                        + Utils.hexdump(currentBytes, maxQuerySizeToLog, 0, length));
+            }
+
+            do {
+                remaining = 4;
+                off = 0;
+                do {
+                    int count = inputStream.read(headerBuffer, off, remaining);
+                    if (count <= 0) {
+                        throw new EOFException("unexpected end of stream, read " + (4 - remaining) + " bytes from " + 4);
+                    }
+                    remaining -= count;
+                    off += count;
+                } while (remaining > 0);
+                inputStream.setLastPacketSeq(headerBuffer[3]);
+
+                length = (headerBuffer[0] & 0xff) + ((headerBuffer[1] & 0xff) << 8) + ((headerBuffer[2] & 0xff) << 16);
+
+                byte[] rawBytes = new byte[length + currentBytes.length];
+                System.arraycopy(currentBytes, 0, rawBytes, 0, currentBytes.length);
+                remaining = length;
+                off = currentBytes.length;
+                do {
+                    int count = inputStream.read(rawBytes, off, remaining);
+                    if (count < 0) {
+                        throw new EOFException("unexpected end of stream, read " + (length - remaining) + " bytes from " + length);
+                    }
+                    remaining -= count;
+                    off += count;
+                } while (remaining > 0);
+                currentBytes = rawBytes;
+                if (logger.isTraceEnabled()) {
+                    logger.trace("read packet seq:" + inputStream.getLastPacketSeq() + " length:" + length + " data:"
+                            + Utils.hexdump(rawBytes, maxQuerySizeToLog, 0, length));
+                }
+            } while (length == 0x00ffffff);
+            return currentBytes;
+        } else {
+            //length > must be tested to identify EOF packet -> array size is checked to be sure that it's not a result-set
+            byte[] rawBytes = (length > 8 && reusableBuffer != null && reusableBuffer.length >= length) ? reusableBuffer : new byte[length];
+            remaining = length;
+            off = 0;
+            do {
+                int count = inputStream.read(rawBytes, off, remaining);
+                if (count < 0) {
+                    throw new EOFException("unexpected end of stream, read " + (length - remaining) + " bytes from " + length);
+                }
+                remaining -= count;
+                off += count;
+            } while (remaining > 0);
+
+            if (logger.isTraceEnabled()) {
+                logger.trace("read packet seq:" + inputStream.getLastPacketSeq() + " length:" + length + " data:"
+                        + Utils.hexdump(rawBytes, maxQuerySizeToLog, 0, length));
+            }
+            return rawBytes;
+
+        }
+    }
+
+    /**
      * Get buffer with shared array of designated length.
      * @param length length to read
      * @param lastReusableArray (optional) lastReusableArray to avoid create new array if possible

@@ -50,7 +50,10 @@ OF SUCH DAMAGE.
 */
 
 
+import org.mariadb.jdbc.internal.MariaDbType;
+import org.mariadb.jdbc.internal.packet.dao.ColumnInformation;
 import org.mariadb.jdbc.internal.packet.read.ReadPacketFetcher;
+import org.mariadb.jdbc.internal.queryresults.resultset.RowStore;
 import org.mariadb.jdbc.internal.stream.MariaDbInputStream;
 import org.mariadb.jdbc.internal.util.buffer.Buffer;
 
@@ -59,7 +62,6 @@ import java.io.InputStream;
 
 public interface RowPacket {
 
-    byte[][] getRow(ReadPacketFetcher packetFetcher, Buffer buffer) throws IOException;
+    RowStore getOffsetAndLength(byte[] row, int position, ColumnInformation columnInformation, int initColumn, int initPosition);
 
-    byte[][] getRow(ReadPacketFetcher packetFetcher, MariaDbInputStream inputStream, int remaining, int read) throws IOException;
 }

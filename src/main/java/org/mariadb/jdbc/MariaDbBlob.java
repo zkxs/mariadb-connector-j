@@ -66,13 +66,17 @@ public class MariaDbBlob implements Blob, Serializable {
     /**
      * the size of the blob.
      */
-    protected int actualSize;
+    protected int length;
 
+    protected int offset;
+
+    protected boolean readOnlyArray;
     /**
      * creates an empty blob.
      */
     public MariaDbBlob() {
         blobContent = new byte[0];
+        readOnlyArray = false;
     }
 
     /**
@@ -85,23 +89,51 @@ public class MariaDbBlob implements Blob, Serializable {
             throw new AssertionError("byte array is null");
         }
         this.blobContent = bytes;
-        this.actualSize = bytes.length;
+        this.length = bytes.length;
+        readOnlyArray = false;
+    }
+
+    /**
+     * creates a blob with content. with offset.
+     * @param bytes the content for the blob.
+     * @param offset offset
+     * @param length data length
+     */
+    public MariaDbBlob(byte[] bytes, int offset, int length) {
+        if (bytes == null) {
+            throw new AssertionError("byte array is null");
+        }
+        this.blobContent = bytes;
+        this.length = length;
+        this.offset = offset;
+        readOnlyArray = true;
+    }
+
+    private void changeToWriteArrayIfNeeded() {
+        if (readOnlyArray) {
+            byte[] newContent = new byte[blobContent.length];
+            System.arraycopy(blobContent, 0, newContent, 0, blobContent.length);
+            blobContent = newContent;
+            offset = 0;
+            readOnlyArray = false;
+        }
     }
 
     private void writeObject(ObjectOutputStream out)
             throws IOException {
-        out.writeInt(actualSize);
-        if (actualSize > 0) {
-            out.write(blobContent, 0, actualSize);
+        changeToWriteArrayIfNeeded();
+        out.writeInt(length);
+        if (length > 0) {
+            out.write(blobContent, 0, length);
         }
     }
 
     private void readObject(ObjectInputStream in)
             throws IOException, ClassNotFoundException {
-        actualSize = in.readInt();
-        blobContent = new byte[actualSize];
-        if (actualSize > 0) {
-            in.readFully(blobContent, 0, actualSize);
+        length = in.readInt();
+        blobContent = new byte[length];
+        if (length > 0) {
+            in.readFully(blobContent, 0, length);
         }
     }
 
@@ -112,7 +144,7 @@ public class MariaDbBlob implements Blob, Serializable {
      * @throws SQLException if there is an error accessing the length of the <code>BLOB</code>
      */
     public long length() throws SQLException {
-        return actualSize;
+        return length;
     }
 
     /**
@@ -146,7 +178,7 @@ public class MariaDbBlob implements Blob, Serializable {
      * @see #setBinaryStream
      */
     public InputStream getBinaryStream() throws SQLException {
-        return getBinaryStream(1, actualSize);
+        return getBinaryStream(offset + 1, length);
     }
 
     /**
@@ -165,10 +197,10 @@ public class MariaDbBlob implements Blob, Serializable {
         if (pos < 1) {
             throw ExceptionMapper.getSqlException("Out of range (position should be > 0)");
         }
-        if (pos - 1 > actualSize) {
+        if (pos - 1 > blobContent.length) {
             throw ExceptionMapper.getSqlException("Out of range (position > stream size)");
         }
-        if (pos + length - 1 > actualSize) {
+        if (pos + length - 1 > blobContent.length) {
             throw ExceptionMapper.getSqlException("Out of range (position + length - 1 > streamSize)");
         }
 
@@ -188,15 +220,15 @@ public class MariaDbBlob implements Blob, Serializable {
         if (start < 1) {
             throw ExceptionMapper.getSqlException("Start should be > 0, first position is 1.");
         }
-        if (start > actualSize) {
-            throw ExceptionMapper.getSqlException("Start should be <= " + actualSize);
+        if (start > length) {
+            throw ExceptionMapper.getSqlException("Start should be <= " + length);
         }
         final long actualStart = start - 1;
-        for (int i = (int) actualStart; i < actualSize; i++) {
+        for (int i = (int) actualStart; i < length; i++) {
             if (blobContent[i] == pattern[0]) {
                 boolean isEqual = true;
                 for (int j = 1; j < pattern.length; j++) {
-                    if (i + j >= actualSize) {
+                    if (i + j >= length) {
                         return -1;
                     }
                     if (blobContent[i + j] != pattern[j]) {
@@ -242,18 +274,19 @@ public class MariaDbBlob implements Blob, Serializable {
      * @since 1.4
      */
     public int setBytes(final long pos, final byte[] bytes) throws SQLException {
+        changeToWriteArrayIfNeeded();
         final int arrayPos = (int) pos - 1;
         final int bytesWritten;
 
         if (blobContent == null) {
             this.blobContent = new byte[arrayPos + bytes.length];
             bytesWritten = blobContent.length;
-            this.actualSize = bytesWritten;
+            this.length = bytesWritten;
         } else if (blobContent.length > arrayPos + bytes.length) {
             bytesWritten = bytes.length;
         } else {
             blobContent = Utils.copyWithLength(blobContent, arrayPos + bytes.length);
-            actualSize = blobContent.length;
+            length = blobContent.length;
             bytesWritten = bytes.length;
         }
 
@@ -288,6 +321,7 @@ public class MariaDbBlob implements Blob, Serializable {
                         final byte[] bytes,
                         final int offset,
                         final int len) throws SQLException {
+        changeToWriteArrayIfNeeded();
         int bytesWritten = 0;
         if (blobContent == null) {
             this.blobContent = new byte[(int) (pos + bytes.length) - (len - offset)];
@@ -301,7 +335,7 @@ public class MariaDbBlob implements Blob, Serializable {
                 bytesWritten++;
             }
         }
-        this.actualSize += bytesWritten;
+        this.length += bytesWritten;
         return bytesWritten;
     }
 
@@ -324,6 +358,7 @@ public class MariaDbBlob implements Blob, Serializable {
      * @since 1.4
      */
     public OutputStream setBinaryStream(final long pos) throws SQLException {
+        changeToWriteArrayIfNeeded();
         if (pos < 1) {
             throw ExceptionMapper.getSqlException("Invalid position in blob");
         }
@@ -345,7 +380,7 @@ public class MariaDbBlob implements Blob, Serializable {
      */
     public void truncate(final long len) throws SQLException {
         this.blobContent = Utils.copyWithLength(this.blobContent, (int) len);
-        this.actualSize = (int) len;
+        this.length = (int) len;
     }
 
     /**
@@ -358,7 +393,7 @@ public class MariaDbBlob implements Blob, Serializable {
      */
     public void free() {
         this.blobContent = null;
-        this.actualSize = 0;
+        this.length = 0;
     }
 
 }

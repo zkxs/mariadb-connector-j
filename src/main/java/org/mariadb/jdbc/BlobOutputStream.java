@@ -75,8 +75,8 @@ class BlobOutputStream extends OutputStream {
         }
         blob.blobContent[pos] = (byte) bit;
         pos++;
-        if (pos > blob.actualSize) {
-            blob.actualSize = pos;
+        if (pos > blob.length) {
+            blob.length = pos;
         }
     }
 
@@ -90,8 +90,8 @@ class BlobOutputStream extends OutputStream {
         }
         System.arraycopy(buf, off, blob.blobContent, pos, len);
         pos += len;
-        if (pos > blob.actualSize) {
-            blob.actualSize = pos;
+        if (pos > blob.length) {
+            blob.length = pos;
         }
     }
 

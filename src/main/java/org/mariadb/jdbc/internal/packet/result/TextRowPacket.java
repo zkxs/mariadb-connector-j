@@ -49,7 +49,10 @@ OF SUCH DAMAGE.
 
 package org.mariadb.jdbc.internal.packet.result;
 
+import org.mariadb.jdbc.internal.MariaDbType;
+import org.mariadb.jdbc.internal.packet.dao.ColumnInformation;
 import org.mariadb.jdbc.internal.packet.read.ReadPacketFetcher;
+import org.mariadb.jdbc.internal.queryresults.resultset.RowStore;
 import org.mariadb.jdbc.internal.stream.MariaDbInputStream;
 import org.mariadb.jdbc.internal.util.buffer.Buffer;
 
@@ -71,92 +74,61 @@ public class TextRowPacket implements RowPacket {
     }
 
     /**
-     * Read text row stream. (to fetch Resulset.next() datas)
+     * Read value corresponding to a column number from row.
      *
-     * @param packetFetcher packetFetcher
-     * @param buffer        current buffer
-     * @return datas object
-     * @throws IOException if any connection error occur
+     * @param row current row bytes
+     * @param column column number ( first is 0)
+     * @param columnInformation column information
+     * @param initColumn last query column for faster access
+     * @param initPosition last query row position for faster access
+     * @return rowStore indicating data bytes, or null if data is null
      */
-    public byte[][] getRow(ReadPacketFetcher packetFetcher, Buffer buffer) throws IOException {
+    public RowStore getOffsetAndLength(byte[] row , int column, ColumnInformation columnInformation, int initColumn, int initPosition) {
 
-        byte[][] valueObjects = new byte[columnInformationLength][];
-        for (int i = 0; i < columnInformationLength; i++) {
-            while (buffer.remaining() == 0) {
-                buffer.appendPacket(packetFetcher.getPacket());
-            }
-            long valueLen = buffer.getLengthEncodedBinary();
-            if (valueLen == -1) {
-                valueObjects[i] = null;
-            } else {
-                while (buffer.remaining() < valueLen) {
-                    buffer.appendPacket(packetFetcher.getPacket());
-                }
-                valueObjects[i] = buffer.readRawBytes((int) valueLen);
-            }
-        }
-        return valueObjects;
-    }
-
-    /**
-     * Read text row stream. (to fetch Resulset.next() datas)
-     *
-     * @param packetFetcher packetFetcher
-     * @param inputStream inputStream
-     * @return datas object
-     * @throws IOException if any connection error occur
-     */
-    public byte[][] getRow(ReadPacketFetcher packetFetcher, MariaDbInputStream inputStream, int remaining, int read) throws IOException {
-
-        byte[][] valueObjects = new byte[columnInformationLength][];
-        int position = 0;
+        int position = initPosition;
+        int currentColumn = initColumn;
         int toReadLen;
 
         while (true) {
-            switch (read) {
+            toReadLen = row[position++] & 0xff;
+            switch (toReadLen) {
                 case 251:
                     toReadLen = -1;
                     break;
                 case 252:
-                    toReadLen = ((inputStream.read() & 0xff) + ((inputStream.read() & 0xff) << 8));
-                    remaining -= 2;
+                    toReadLen = ((row[position++] & 0xff) + ((row[position++] & 0xff) << 8));
                     break;
                 case 253:
-                    toReadLen = (inputStream.read() & 0xff)
-                            + ((inputStream.read() & 0xff) << 8)
-                            + ((inputStream.read() & 0xff) << 16);
-                    remaining -= 3;
+                    toReadLen = (row[position++] & 0xff)
+                            + ((row[position++] & 0xff) << 8)
+                            + ((row[position++] & 0xff) << 16);
                     break;
                 case 254:
-                    toReadLen = (int) (((inputStream.read() & 0xff)
-                            + ((long) (inputStream.read() & 0xff) << 8)
-                            + ((long) (inputStream.read() & 0xff) << 16)
-                            + ((long) (inputStream.read() & 0xff) << 24)
-                            + ((long) (inputStream.read() & 0xff) << 32)
-                            + ((long) (inputStream.read() & 0xff) << 40)
-                            + ((long) (inputStream.read() & 0xff) << 48)
-                            + ((long) (inputStream.read() & 0xff) << 56)));
-                    remaining -= 8;
+                    toReadLen = (int) (((row[position++] & 0xff)
+                            + ((long) (row[position++] & 0xff) << 8)
+                            + ((long) (row[position++] & 0xff) << 16)
+                            + ((long) (row[position++] & 0xff) << 24)
+                            + ((long) (row[position++] & 0xff) << 32)
+                            + ((long) (row[position++] & 0xff) << 40)
+                            + ((long) (row[position++] & 0xff) << 48)
+                            + ((long) (row[position++] & 0xff) << 56)));
                     break;
                 default:
-                    toReadLen = read;
+                    break;
             }
-            if (toReadLen == -1) {
-                valueObjects[position++] = null;
-            } else if (toReadLen == 0) {
-                valueObjects[position++] = new byte[0];
+            if (currentColumn++ == column) {
+                if (toReadLen == -1) {
+                    return null;
+                } else if (toReadLen == 0) {
+                    return new RowStore(row, position, 0, columnInformation, column);
+                } else {
+                    return new RowStore(row, position, toReadLen, columnInformation, column);
+                }
             } else {
-                valueObjects[position++] = packetFetcher.readLength(toReadLen);
-                remaining -= toReadLen;
+                if (toReadLen > 0) position += toReadLen;
             }
-            if (remaining <= 0) {
-                break;
-            }
-            read = inputStream.read() & 0xff;
-            remaining -= 1;
         }
-        return valueObjects;
-    }
 
+    }
 
 }

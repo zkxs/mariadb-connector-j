@@ -49,8 +49,13 @@ OF SUCH DAMAGE.
 
 package org.mariadb.jdbc.internal.packet.send;
 
+import org.mariadb.jdbc.internal.packet.Packet;
+import org.mariadb.jdbc.internal.packet.read.ReadPacketFetcher;
+import org.mariadb.jdbc.internal.packet.result.ErrorPacket;
 import org.mariadb.jdbc.internal.stream.PacketOutputStream;
 import org.mariadb.jdbc.internal.util.Utils;
+import org.mariadb.jdbc.internal.util.buffer.Buffer;
+import org.mariadb.jdbc.internal.util.dao.QueryException;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -72,10 +77,25 @@ public class SendNativePasswordAuthPacket extends AbstractAuthSwitchSendResponse
         try {
             writer.startPacket(packSeq);
             writer.write(Utils.encryptPassword(password, authData));
-            writer.finishPacketWithoutRelease(false);
+            boolean packetSend = writer.finishPacketWithoutRelease(false);
+            if (!packetSend) {
+                //empty password
+                writer.writeEmptyPacket(packSeq);
+            }
             writer.releaseBuffer();
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException("Could not use SHA-1, failing", e);
         }
     }
+
+    @Override
+    public void handleResultPacket(ReadPacketFetcher packetFetcher) throws QueryException, IOException {
+        Buffer buffer = packetFetcher.getReusableBuffer();
+        if (buffer.getByteAt(0) == Packet.ERROR) {
+            ErrorPacket ep = new ErrorPacket(buffer);
+            String message = ep.getMessage();
+            throw new QueryException("Could not connect: " + message, ep.getErrorNumber(), ep.getSqlState());
+        }
+    }
+
 }
