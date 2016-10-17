@@ -10,6 +10,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.sql.*;
 
 import static org.junit.Assert.*;
@@ -561,7 +562,19 @@ public class DatatypeTest extends BaseTest {
                 int read = is.read();
                 assertEquals(i, read);
             }
-            assertEquals(rs.getString(1), new String(allBytes, "UTF-8"));
+            String valueFromResulset = rs.getString(1);
+            String initialValue = new String(allBytes, 0, allBytes.length, StandardCharsets.UTF_8);
+
+            //don't use String comparison since String will use http://docs.oracle.com/javase/8/docs/api/java/io/DataInput.html#modified-utf-8
+            for (int i = 0; i < 256; i++) {
+                assertEquals(valueFromResulset.getBytes()[i], initialValue.getBytes()[i]);
+            }
+            boolean isJava7 = System.getProperty("java.version").contains("1.7.");
+            if (!isJava7) {
+                //java 7 use String comparison with modified UTF-8
+                //(http://docs.oracle.com/javase/8/docs/api/java/io/DataInput.html#modified-utf-8)
+                assertEquals(initialValue, valueFromResulset);
+            }
 
             is = rs.getBinaryStream(2);
 
