@@ -67,6 +67,8 @@ public interface PacketInputStream {
 
     int getLastPacketSeq();
 
+    void incLastPacketSeq();
+
     int getCompressLastPacketSeq();
 
     void close() throws IOException;

@@ -442,8 +442,14 @@ public enum DefaultOptions {
      * Hexadecimal value of those packet will be added to stacktrace when an IOException occur.
      * This options has no performance incidence (&lt; 1 microseconds per query) but driver will then take 16kb more memory.
      */
-    ENABLE_PACKET_DEBUG("enablePacketDebug", Boolean.FALSE, "1.6.0");
+    ENABLE_PACKET_DEBUG("enablePacketDebug", Boolean.FALSE, "1.6.0"),
 
+    /**
+     * Server RSA public key path.
+     * Needed for sha256_password authentication.
+     * (alias serverRSAPublicKeyFile)
+     */
+    SERVER_RSA_PUBLIC_KEY_FILE("serverRsaPublicKeyFile", "2.1.0");
 
     protected final String name;
     protected final Object objType;
@@ -576,6 +582,8 @@ public enum DefaultOptions {
                         case "keyStore":
                             propertyValue = properties.getProperty("clientCertificateKeyStoreUrl");
                             break;
+                        case "serverRsaPublicKeyFile":
+                            propertyValue = properties.getProperty("serverRSAPublicKeyFile");
                         default:
                             //no alias
                     }

@@ -55,6 +55,7 @@ package org.mariadb.jdbc.internal.com.send;
 import org.mariadb.jdbc.MariaDbDatabaseMetaData;
 import org.mariadb.jdbc.internal.MariaDbServerCapabilities;
 import org.mariadb.jdbc.internal.com.read.Buffer;
+import org.mariadb.jdbc.internal.io.input.PacketInputStream;
 import org.mariadb.jdbc.internal.io.output.PacketOutputStream;
 import org.mariadb.jdbc.internal.protocol.authentication.DefaultAuthenticationProvider;
 import org.mariadb.jdbc.internal.util.Options;
@@ -64,6 +65,8 @@ import org.mariadb.jdbc.internal.util.constant.Version;
 
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
+import java.sql.SQLException;
 import java.util.StringTokenizer;
 
 /**
@@ -93,6 +96,7 @@ public class SendHandshakeResponsePacket {
     /**
      * Send handshake response packet.
      *
+     * @param reader             input stream
      * @param pos                output stream
      * @param username           user name
      * @param password           password
@@ -101,31 +105,30 @@ public class SendHandshakeResponsePacket {
      * @param serverCapabilities server capabilities
      * @param serverLanguage     server language (utf8 / utf8mb4 collation)
      * @param seed               seed
-     * @param packetSeq          packet sequence
      * @param plugin             plugin name
      * @param options            user options
-     * @throws IOException if socket exception occur
+     * @throws IOException  if socket exception occur
+     * @throws SQLException if plugin has issue
      * @see <a href="https://mariadb.com/kb/en/mariadb/1-connecting-connecting/#handshake-response-packet">protocol documentation</a>
      */
-    public static void send(final PacketOutputStream pos,
-                            String username,
-                            final String password,
-                            final String database,
-                            final long clientCapabilities,
-                            final long serverCapabilities,
-                            final byte serverLanguage,
-                            final byte[] seed,
-                            final byte packetSeq,
-                            final String plugin,
-                            final Options options) throws IOException {
+    public static void send(
+            final PacketInputStream reader,
+            final PacketOutputStream pos,
+            String username,
+            final String password,
+            final String database,
+            final long clientCapabilities,
+            final long serverCapabilities,
+            final byte serverLanguage,
+            final byte[] seed,
+            final String plugin,
+            final Options options) throws IOException, SQLException {
 
-        pos.startPacket(packetSeq);
-
+        pos.permitTrace(false);
         final byte[] authData;
         switch (plugin) {
             case "": //CONJ-274 : permit connection mysql 5.1 db
             case DefaultAuthenticationProvider.MYSQL_NATIVE_PASSWORD:
-                pos.permitTrace(false);
                 try {
                     authData = Utils.encryptPassword(password, seed, options.passwordCharacterEncoding);
                     break;
@@ -133,16 +136,22 @@ public class SendHandshakeResponsePacket {
                     throw new RuntimeException("Could not use SHA-1, failing", e);
                 }
             case DefaultAuthenticationProvider.MYSQL_CLEAR_PASSWORD:
-                pos.permitTrace(false);
                 if (options.passwordCharacterEncoding != null && !options.passwordCharacterEncoding.isEmpty()) {
                     authData = password.getBytes(options.passwordCharacterEncoding);
                 } else {
                     authData = password.getBytes();
                 }
                 break;
+
+            case DefaultAuthenticationProvider.SHA256_PASSWORD:
+                authData = SendSha256PasswordAuthPacket.getSha256pwd(options, password, seed, pos, reader);
+                break;
+
             default:
                 authData = new byte[0];
         }
+
+        pos.startPacket(reader.getLastPacketSeq() + 1);
 
         pos.writeInt((int) clientCapabilities);
         pos.writeInt(1024 * 1024 * 1024);
@@ -183,6 +192,16 @@ public class SendHandshakeResponsePacket {
 
         pos.flush();
         pos.permitTrace(true);
+
+        //in case of if default authentication is SHA256 and server public file is not set, no password has been send,
+        // but public file has been asked, so password must be send
+        if (DefaultAuthenticationProvider.SHA256_PASSWORD.equals(plugin)
+                && !options.useSsl && (options.serverRsaPublicKeyFile == null || options.serverRsaPublicKeyFile.isEmpty())) {
+            PublicKey publicKey = SendSha256PasswordAuthPacket.readPublicKeyFromSocket(reader);
+            SendSha256PasswordAuthPacket.sendSha256PasswordPacket(publicKey, password, seed,
+                    options.passwordCharacterEncoding, pos, reader.getLastPacketSeq() + 1);
+        }
+
     }
 
     private static void writeConnectAttributes(PacketOutputStream pos, String connectionAttributes) throws IOException {

@@ -346,6 +346,11 @@ public class StandardPacketInputStream implements PacketInputStream {
     }
 
     @Override
+    public void incLastPacketSeq() {
+        packetSeq++;
+    }
+
+    @Override
     public int getLastPacketSeq() {
         return packetSeq;
     }

@@ -55,6 +55,7 @@ package org.mariadb.jdbc.internal.protocol.authentication;
 
 import org.mariadb.jdbc.internal.com.send.*;
 import org.mariadb.jdbc.internal.io.input.PacketInputStream;
+import org.mariadb.jdbc.internal.util.Options;
 
 import java.sql.SQLException;
 
@@ -64,6 +65,7 @@ public class DefaultAuthenticationProvider {
     public static final String MYSQL_CLEAR_PASSWORD = "mysql_clear_password";
     public static final String GSSAPI_CLIENT = "auth_gssapi_client";
     public static final String DIALOG = "dialog";
+    public static final String SHA256_PASSWORD = "sha256_password";
 
     /**
      * Process AuthenticationSwitch.
@@ -74,12 +76,13 @@ public class DefaultAuthenticationProvider {
      * @param authData                  auth data
      * @param seqNo                     packet sequence number
      * @param passwordCharacterEncoding password character encoding
+     * @param options                   options
      * @return authentication response according to parameters
      * @throws SQLException if error occur.
      */
     public static InterfaceAuthSwitchSendResponsePacket processAuthPlugin(PacketInputStream reader, String plugin, String password,
-                                                                          byte[] authData, int seqNo, String passwordCharacterEncoding)
-            throws SQLException {
+                                                                          byte[] authData, int seqNo, String passwordCharacterEncoding,
+                                                                          Options options) throws SQLException {
         switch (plugin) {
             case MYSQL_NATIVE_PASSWORD:
                 return new SendNativePasswordAuthPacket(password, authData, seqNo, passwordCharacterEncoding);
@@ -91,6 +94,8 @@ public class DefaultAuthenticationProvider {
                 return new SendPamAuthPacket(reader, password, authData, seqNo, passwordCharacterEncoding);
             case GSSAPI_CLIENT:
                 return new SendGssApiAuthPacket(reader, password, authData, seqNo, passwordCharacterEncoding);
+            case SHA256_PASSWORD:
+                return new SendSha256PasswordAuthPacket(password, authData, seqNo, passwordCharacterEncoding, options, reader);
             default:
                 throw new SQLException("Client does not support authentication protocol requested by server. "
                         + "Consider upgrading MariaDB client. plugin was = " + plugin, "08004", 1251);

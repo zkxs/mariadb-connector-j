@@ -779,7 +779,7 @@ public class DriverTest extends BaseTest {
 
         requireMinimumVersion(5, 0);
         try {
-            sharedConnection.createStatement().executeUpdate("drop database test_testdrop");
+            sharedConnection.createStatement().executeUpdate("drop database if exists test_testdrop");
         } catch (Exception e) {
             //eat exception
         }

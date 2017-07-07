@@ -115,6 +115,7 @@ public class Options {
     public Boolean usePipelineAuth;
     public boolean killFetchStmtOnClose;
     public boolean enablePacketDebug;
+    public String serverRsaPublicKeyFile;
 
     //logging options
     public boolean log;
@@ -239,6 +240,11 @@ public class Options {
         if (serverTimezone != null ? !serverTimezone.equals(options.serverTimezone) : options.serverTimezone != null) {
             return false;
         }
+        if ((serverRsaPublicKeyFile != null && !serverRsaPublicKeyFile.equals(options.serverRsaPublicKeyFile))
+                || (serverRsaPublicKeyFile == null && options.serverRsaPublicKeyFile != null)) {
+            return false;
+        }
+
         if (prepStmtCacheSize != null ? !prepStmtCacheSize.equals(options.prepStmtCacheSize) : options.prepStmtCacheSize != null) {
             return false;
         }

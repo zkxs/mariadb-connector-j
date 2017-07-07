@@ -385,4 +385,35 @@ public class ConnectionTest extends BaseTest {
             assertEquals(1, failedProperties.size());
         }
     }
+
+
+    @Test
+    public void sha256PasswordUser() throws Exception {
+        Statement stmt = sharedConnection.createStatement();
+        boolean handleSha256pwd = false;
+        try {
+            //mysql compiled with openssl or mariadb when https://jira.mariadb.org/browse/MDEV-9804
+            stmt.execute("select @@Rsa_public_key");
+            handleSha256pwd = true;
+        } catch (Exception e) {
+            //eat
+        }
+
+        if (handleSha256pwd) {
+            stmt.execute("DROP USER IF EXISTS 'sha256user'@'%'");
+            stmt.execute("CREATE USER 'sha256user'@'%' IDENTIFIED WITH sha256_password");
+            stmt.execute("SET old_passwords = 2");
+            stmt.execute("SET PASSWORD FOR 'sha256user'@'%' = PASSWORD('Sh@256Pa33')");
+            stmt.execute("GRANT ALL on *.* to 'sha256user'@'%'");
+
+            String connU = "jdbc:mariadb://" + ((hostname == null) ? "localhost" : hostname) + ":" + port + "/" + database;
+            String connUri = connU + "?user=sha256user&password=Sh@256Pa33"
+                    + (parameters != null ? "&" + parameters : "");
+
+            try (Connection connection = openConnection(connUri, null)) {
+                connection.createStatement().execute("SELECT 1");
+            }
+        }
+
+    }
 }
