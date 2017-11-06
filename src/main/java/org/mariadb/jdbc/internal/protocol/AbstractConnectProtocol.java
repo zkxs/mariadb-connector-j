@@ -107,17 +107,18 @@ import java.security.cert.X509Certificate;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
+import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.mariadb.jdbc.internal.com.Packet.*;
 
 public abstract class AbstractConnectProtocol implements Protocol {
-    private static final byte[] SESSION_QUERY = ("SELECT @@max_allowed_packet,"
+    public static final byte[] SESSION_QUERY = ("SELECT @@max_allowed_packet,"
             + "@@system_time_zone,"
             + "@@time_zone,"
             + "@@auto_increment_increment").getBytes(StandardCharsets.UTF_8);
-    private static final byte[] IS_MASTER_QUERY = "show global variables like 'innodb_read_only'".getBytes(StandardCharsets.UTF_8);
+    public static final byte[] IS_MASTER_QUERY = "show global variables like 'innodb_read_only'".getBytes(StandardCharsets.UTF_8);
     private static final Logger logger = LoggerFactory.getLogger(AbstractConnectProtocol.class);
     protected final ReentrantLock lock;
     protected final UrlParser urlParser;
@@ -470,16 +471,52 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
             if (mustLoadAdditionalInfo) {
                 Map<String, String> serverData = new TreeMap<>();
-                if (options.usePipelineAuth && !options.createDatabaseIfNotExist) {
+
+                if ((serverCapabilities & MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH) != 0) {
+
+                    //read results
+                    Results results = new Results();
                     try {
-                        sendPipelineAdditionalData();
-                        readPipelineAdditionalData(serverData);
+                        getResult(results);
+                        results.commandEnd();
+
+                        if (results.getMoreResults(Statement.CLOSE_CURRENT_RESULT, this)) {
+                            ResultSet resultSet = results.getResultSet();
+                            resultSet.next();
+
+                            serverData.put("max_allowed_packet", resultSet.getString(1));
+                            serverData.put("system_time_zone", resultSet.getString(2));
+                            serverData.put("time_zone", resultSet.getString(3));
+                            serverData.put("auto_increment_increment", resultSet.getString(4));
+
+                            if (results.getMoreResults(Statement.CLOSE_CURRENT_RESULT, this)) {
+                                readPipelineCheckMaster(results.getResultSet());
+                            }
+
+                        } else {
+                            throw new SQLException("Error reading SessionVariables results. Socket is connected ? "
+                                    + socket.isConnected());
+                        }
+
                     } catch (SQLException sqle) {
-                        //in case pipeline is not supported
-                        //(proxy flush socket after reading first packet)
-                        additionalData(serverData);
+                        //fallback in case of galera non primary nodes that permit only show / set command,
+                        //not SELECT when not part of quorum
+                        requestSessionDataWithShow(serverData);
                     }
-                } else additionalData(serverData);
+
+                } else {
+
+                    if (options.usePipelineAuth && !options.createDatabaseIfNotExist) {
+                        try {
+                            sendPipelineAdditionalData();
+                            readPipelineAdditionalData(serverData);
+                        } catch (SQLException sqle) {
+                            //in case pipeline is not supported
+                            //(proxy flush socket after reading first packet)
+                            additionalData(serverData);
+                        }
+                    } else additionalData(serverData);
+                }
 
                 writer.setMaxAllowedPacket(Integer.parseInt(serverData.get("max_allowed_packet")));
                 autoIncrementIncrement = Integer.parseInt(serverData.get("auto_increment_increment"));
@@ -801,10 +838,10 @@ public abstract class AbstractConnectProtocol implements Protocol {
                 exchangeCharset,
                 packetSeq,
                 options,
+                urlParser.getHaMode(),
                 greetingPacket);
 
         Buffer buffer = reader.getPacket(false);
-
         if ((buffer.getByteAt(0) & 0xFF) == 0xFE) {
 
             writer.permitTrace(false);
@@ -848,6 +885,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
                 }
                 throw new SQLException(errorPacket.getMessage(), errorPacket.getSqlState(), errorPacket.getErrorNumber());
             }
+
             serverStatus = new OkPacket(buffer).getServerStatus();
         }
 
@@ -867,7 +905,9 @@ public abstract class AbstractConnectProtocol implements Protocol {
                 | MariaDbServerCapabilities.PLUGIN_AUTH
                 | MariaDbServerCapabilities.CONNECT_ATTRS
                 | MariaDbServerCapabilities.PLUGIN_AUTH_LENENC_CLIENT_DATA
-                | MariaDbServerCapabilities.CLIENT_SESSION_TRACK;
+                | MariaDbServerCapabilities.CLIENT_SESSION_TRACK
+                | MariaDbServerCapabilities.MARIADB_CLIENT_COM_MULTI
+                | MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH;
 
         if (options.allowMultiQueries || (options.rewriteBatchedStatements)) {
             capabilities |= MariaDbServerCapabilities.MULTI_STATEMENTS;
@@ -1038,6 +1078,10 @@ public abstract class AbstractConnectProtocol implements Protocol {
     }
 
     public void readPipelineCheckMaster() throws SQLException {
+        //nothing if not aurora
+    }
+
+    protected void readPipelineCheckMaster(ResultSet resultSet) throws SQLException {
         //nothing if not aurora
     }
 

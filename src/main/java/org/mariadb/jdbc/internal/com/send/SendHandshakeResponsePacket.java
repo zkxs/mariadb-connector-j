@@ -52,20 +52,28 @@
 
 package org.mariadb.jdbc.internal.com.send;
 
+import org.mariadb.jdbc.MariaDbConnection;
 import org.mariadb.jdbc.MariaDbDatabaseMetaData;
 import org.mariadb.jdbc.internal.MariaDbServerCapabilities;
 import org.mariadb.jdbc.internal.com.read.Buffer;
 import org.mariadb.jdbc.internal.com.read.ReadInitialHandShakePacket;
 import org.mariadb.jdbc.internal.io.output.PacketOutputStream;
+import org.mariadb.jdbc.internal.protocol.AbstractConnectProtocol;
+import org.mariadb.jdbc.internal.protocol.AuroraProtocol;
 import org.mariadb.jdbc.internal.protocol.authentication.DefaultAuthenticationProvider;
 import org.mariadb.jdbc.internal.util.Options;
 import org.mariadb.jdbc.internal.util.PidFactory;
 import org.mariadb.jdbc.internal.util.Utils;
+import org.mariadb.jdbc.internal.util.constant.HaMode;
 import org.mariadb.jdbc.internal.util.constant.Version;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.NoSuchAlgorithmException;
 import java.util.StringTokenizer;
+
+import static org.mariadb.jdbc.internal.com.Packet.COM_MULTI;
+import static org.mariadb.jdbc.internal.com.Packet.COM_QUERY;
 
 /**
  * 4                            client_flags 4                            max_packet_size 1 charset_number 23 (filler)
@@ -103,6 +111,7 @@ public class SendHandshakeResponsePacket {
      * @param serverLanguage     server language (utf8 / utf8mb4 collation)
      * @param packetSeq          packet sequence
      * @param options            user options
+     * @param haMode             high availability mode
      * @param greetingPacket     server handshake packet information
      * @throws IOException if socket exception occur
      * @see <a href="https://mariadb.com/kb/en/mariadb/1-connecting-connecting/#handshake-response-packet">protocol documentation</a>
@@ -116,6 +125,7 @@ public class SendHandshakeResponsePacket {
                             final byte serverLanguage,
                             final byte packetSeq,
                             final Options options,
+                            final HaMode haMode,
                             final ReadInitialHandShakePacket greetingPacket) throws IOException {
 
         pos.startPacket(packetSeq);
@@ -184,9 +194,60 @@ public class SendHandshakeResponsePacket {
             writeConnectAttributes(pos, options.connectionAttributes);
         }
 
+        if ((serverCapabilities & MariaDbServerCapabilities.MARIADB_CLIENT_COM_IN_AUTH) != 0) {
+            writeAdditionalQueries(pos, serverCapabilities, options, haMode, database);
+        }
         pos.flush();
         pos.permitTrace(true);
     }
+
+
+    private static void writeAdditionalQueries(PacketOutputStream pos, long serverCapabilities, Options options, HaMode haMode, String database)
+            throws IOException {
+
+        //reservation for authentication length
+        Buffer buffer = new Buffer(new byte[200]);
+
+        //send variables command
+        StringBuilder sessionOption = new StringBuilder("set autocommit=").append(options.autocommit ? "1" : "0");
+        if ((serverCapabilities & MariaDbServerCapabilities.CLIENT_SESSION_TRACK) != 0) {
+            sessionOption.append(", session_track_schema=1");
+            if (options.rewriteBatchedStatements) {
+                sessionOption.append(", session_track_system_variables='auto_increment_increment' ");
+            }
+        }
+
+        if (options.jdbcCompliantTruncation) {
+            sessionOption.append(", sql_mode = concat(@@sql_mode,',STRICT_TRANS_TABLES')");
+        }
+
+        if (options.sessionVariables != null && !options.sessionVariables.isEmpty()) {
+            sessionOption.append(",").append(Utils.parseSessionVariables(options.sessionVariables));
+        }
+
+        buffer.writeBytes(COM_QUERY, sessionOption.toString().getBytes(StandardCharsets.UTF_8));
+
+        //ask for session variables
+        buffer.writeBytes(COM_QUERY, AbstractConnectProtocol.SESSION_QUERY);
+
+        //ask if server is read-only
+        if (haMode == HaMode.AURORA) {
+            buffer.writeBytes(COM_QUERY, AuroraProtocol.IS_MASTER_QUERY);
+        }
+
+        if (options.createDatabaseIfNotExist) {
+            // Try to create the database if it does not exist
+            String quotedDb = MariaDbConnection.quoteIdentifier(database);
+            buffer.writeBytes(COM_QUERY, ("CREATE DATABASE IF NOT EXISTS " + quotedDb).getBytes(StandardCharsets.UTF_8));
+            buffer.writeBytes(COM_QUERY, ("USE " + quotedDb).getBytes(StandardCharsets.UTF_8));
+        }
+
+        pos.writeFieldLength(buffer.position + 1); //COM_MULTI packet length
+        pos.write(COM_MULTI);
+        pos.write(buffer.buf, 0, buffer.position);
+
+    }
+
 
     private static final byte[] _CLIENT_NAME = "_client_name".getBytes();
     private static final byte[] _CLIENT_VERSION = "_client_version".getBytes();

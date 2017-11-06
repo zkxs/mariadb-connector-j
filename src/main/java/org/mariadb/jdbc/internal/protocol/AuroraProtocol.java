@@ -301,8 +301,11 @@ public class AuroraProtocol extends MastersSlavesProtocol {
         Results results = new Results();
         getResult(results);
         results.commandEnd();
-        ResultSet resultSet = results.getResultSet();
+        readPipelineCheckMaster(results.getResultSet());
+    }
 
+    @Override
+    protected void readPipelineCheckMaster(ResultSet resultSet) throws SQLException {
         if (!resultSet.next()) throw new SQLException("Error checking Aurora's master status : No information");
 
         this.masterConnection = "OFF".equals(resultSet.getString(2));
@@ -310,7 +313,6 @@ public class AuroraProtocol extends MastersSlavesProtocol {
         writer.setServerThreadId(this.serverThreadId, this.masterConnection);
         //Aurora replicas have read-only flag forced
         this.readOnly = !this.masterConnection;
-
     }
 
     @Override
