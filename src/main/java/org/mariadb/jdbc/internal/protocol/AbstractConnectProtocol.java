@@ -1193,17 +1193,38 @@ public abstract class AbstractConnectProtocol implements Protocol {
         return minorVersion;
     }
 
+    public int getPatchServerVersion() {
+        return patchVersion;
+    }
+
+    public boolean minVersion(int major, int minor, int patch) {
+        return (majorVersion > major
+                || (majorVersion == major && minorVersion > minor)
+                || (majorVersion == major && minorVersion == minor && patchVersion >= patch));
+
+    }
+
     /**
      * Return possible protocols : values of option enabledSslProtocolSuites is set, or default to "TLSv1,TLSv1.1".
      * MariaDB versions &ge; 10.0.15 and &ge; 5.5.41 supports TLSv1.2 if compiled with openSSL (default).
-     * MySQL community versions &ge; 5.7.10 is compile with yaSSL, so max TLS is TLSv1.1.
      *
      * @param sslSocket current sslSocket
      * @throws SQLException if protocol isn't a supported protocol
      */
     private void enabledSslProtocolSuites(SSLSocket sslSocket) throws SQLException {
         if (options.enabledSslProtocolSuites == null) {
-            sslSocket.setEnabledProtocols(new String[]{"TLSv1", "TLSv1.1"});
+            //MariaDB is compile with openSSL by default, but .tar use YaSSL.
+            //YaSSL fail to understand TLSv1.2 resulting in SSL failed authentication.
+            //see https://jira.mariadb.org/browse/MDEV-12190 corrected MariaDB >= 10.2.6.
+            //MySQL has the same issue when using YaSSL that is default for community version until 8.0.4.
+            String[] defaultProtocol;
+            if ((isServerMariaDb() && minVersion(10, 2, 6))) {
+                defaultProtocol = new String[]{"TLSv1", "TLSv1.1", "TLSv1.2"};
+            } else {
+                defaultProtocol = new String[]{"TLSv1", "TLSv1.1"};
+            }
+
+            sslSocket.setEnabledProtocols(defaultProtocol);
         } else {
             List<String> possibleProtocols = Arrays.asList(sslSocket.getSupportedProtocols());
             String[] protocols = options.enabledSslProtocolSuites.split("[,;\\s]+");

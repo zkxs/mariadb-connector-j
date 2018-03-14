@@ -805,6 +805,25 @@ public class BaseTest {
     }
 
     /**
+     * Check if version if at minimum the version asked.
+     *
+     * @param major database major version
+     * @param minor database minor version
+     * @throws SQLException exception
+     */
+    public boolean minVersion(int major, int minor, int patch) throws SQLException {
+        MariaDbDatabaseMetaData md = (MariaDbDatabaseMetaData) sharedConnection.getMetaData();
+        int dbMajor = md.getDatabaseMajorVersion();
+        int dbMinor = md.getDatabaseMinorVersion();
+        int dbPatch = md.getDatabasePatchVersion();
+
+        return (dbMajor > major
+                || (dbMajor == major && dbMinor > minor)
+                || (dbMajor == major && dbMinor == minor && dbPatch >= patch));
+
+    }
+
+    /**
      * Check if version if before the version asked.
      *
      * @param major database major version
@@ -848,6 +867,10 @@ public class BaseTest {
 
     public void requireMinimumVersion(int major, int minor) throws SQLException {
         Assume.assumeTrue(minVersion(major, minor));
+    }
+
+    public void requireMinimumVersion(int major, int minor, int patch) throws SQLException {
+        Assume.assumeTrue(minVersion(major, minor, patch));
 
     }
 

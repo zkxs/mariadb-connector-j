@@ -2495,6 +2495,10 @@ public class MariaDbDatabaseMetaData implements DatabaseMetaData {
         return connection.getProtocol().getMinorServerVersion();
     }
 
+    public int getDatabasePatchVersion() throws SQLException {
+        return connection.getProtocol().getPatchServerVersion();
+    }
+
     @Override
     public int getJDBCMajorVersion() throws SQLException {
         return 4;

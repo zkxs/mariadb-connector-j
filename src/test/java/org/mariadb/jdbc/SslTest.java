@@ -212,18 +212,19 @@ public class SslTest extends BaseTest {
 
     @Test
     public void useSslForceTlsV12() throws Exception {
-        Assume.assumeFalse(Platform.isWindows());
-        // Only test with MariaDB since MySQL community is compiled with yaSSL
-        if (isMariadbServer()) useSslForceTls("TLSv1.2");
+        //YaSSL implementation is corrected in MariaDB > 10.2.6 (TLSv1.2 was crashing protocol then)
+        //MySQL default to openSSL for version 8.0.4
+        //so MySQL compile with YaSSL will still fail
+        Assume.assumeTrue((isMariadbServer() && minVersion(10, 2, 6))
+                || (!isMariadbServer() && minVersion(8, 0, 4)));
+        useSslForceTls("TLSv1.2");
     }
 
     @Test
     public void useSslForceTlsV12AndCipher() throws Exception {
-        Assume.assumeFalse(Platform.isWindows());
-        // Only test with MariaDB since MySQL community is compiled with yaSSL
-        if (isMariadbServer()) {
-            useSslForceTls("TLSv1.2", "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256");
-        }
+        Assume.assumeTrue((isMariadbServer() && minVersion(10, 2, 6))
+                || (!isMariadbServer() && minVersion(8, 0, 4)));
+        useSslForceTls("TLSv1.2,TLSv1.1", "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256");
     }
 
     @Test
