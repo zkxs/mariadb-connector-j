@@ -657,6 +657,12 @@ public enum DefaultOptions {
       "2.4.3",
       "Resultset metadata getTableName always return blank. "
           + "This option is mainly for ORACLE db compatibility",
+      false),
+  ENABLE_REDIRECTION(
+      "enableRedirect",
+      Boolean.FALSE,
+      "2.5.0",
+      "This option let user permit using proxy redirection feature",
       false);
 
   private final String optionName;

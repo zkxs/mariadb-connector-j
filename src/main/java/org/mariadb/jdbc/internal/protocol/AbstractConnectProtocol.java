@@ -112,6 +112,8 @@ import org.mariadb.jdbc.internal.protocol.authentication.DefaultAuthenticationPr
 import org.mariadb.jdbc.internal.protocol.tls.HostnameVerifierImpl;
 import org.mariadb.jdbc.internal.protocol.tls.SslFactory;
 import org.mariadb.jdbc.internal.util.Options;
+import org.mariadb.jdbc.internal.util.RedirectionInfo;
+import org.mariadb.jdbc.internal.util.RedirectionInfoCache;
 import org.mariadb.jdbc.internal.util.ServerPrepareStatementCache;
 import org.mariadb.jdbc.internal.util.Utils;
 import org.mariadb.jdbc.internal.util.constant.HaMode;
@@ -161,6 +163,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
   private int patchVersion;
   private TimeZone timeZone;
   protected int socketTimeout;
+  private static RedirectionInfoCache redirectionInfoCache;
 
   /**
    * Get a protocol instance.
@@ -183,6 +186,13 @@ public abstract class AbstractConnectProtocol implements Protocol {
     if (options.cachePrepStmts && options.useServerPrepStmts) {
       serverPrepareStatementCache = ServerPrepareStatementCache
           .newInstance(options.prepStmtCacheSize, this);
+    }
+    if (options.enableRedirect && redirectionInfoCache == null) {
+      synchronized(this) {
+        if (redirectionInfoCache == null) {
+          redirectionInfoCache = RedirectionInfoCache.newInstance(32);
+        }
+      }
     }
   }
 
@@ -344,7 +354,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
     }
 
     try {
-      createConnection((currentHost != null) ? currentHost.host : null,
+      connectWithPossibleRedirection((currentHost != null) ? currentHost.host : null,
           (currentHost != null) ? currentHost.port : 3306,
           username);
     } catch (SQLException exception) {
@@ -354,7 +364,42 @@ public abstract class AbstractConnectProtocol implements Protocol {
     }
   }
 
-  private void createConnection(String host, int port, String username) throws SQLException {
+  private void connectWithPossibleRedirection(String host, int port, String username)
+      throws SQLException {
+    if (redirectionInfoCache != null) {
+      RedirectionInfo redirectionInfo = redirectionInfoCache.get(username, new HostAddress(host,
+          port));
+      if (redirectionInfo != null) {
+        //skip connection to proxy
+        try {
+          createConnection(redirectionInfo.getHost().host,
+              redirectionInfo.getHost().port,
+              redirectionInfo.getUser() != null ? redirectionInfo.getUser() : username, false);
+          return;
+        } catch (SQLException sqle) {
+          redirectionInfoCache.remove(redirectionInfo);
+          //eat exception, connect using standard
+        }
+      }
+    }
+
+    RedirectionInfo redirectionInfo = createConnection(host, port, username, true);
+    if (redirectionInfo != null) {
+      redirectionInfoCache.put(username, new HostAddress(host, port), redirectionInfo);
+      logger.info("Redirection to " + redirectionInfo.toString());
+      try {
+        createConnection(redirectionInfo.getHost().host,
+          redirectionInfo.getHost().port,
+          redirectionInfo.getUser() != null ? redirectionInfo.getUser() : username, false);
+      } catch (SQLException sqle) {
+        redirectionInfoCache.remove(redirectionInfo);
+        throw sqle;
+      }
+    }
+  }
+
+  private RedirectionInfo createConnection(String host, int port, String username,
+                                  boolean permitRedirection) throws SQLException {
     this.socket = createSocket(host, port, options);
     assignStream(this.socket, options);
 
@@ -383,7 +428,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
           exchangeCharset,
           serverThreadId);
 
-      authenticationHandler(
+      RedirectionInfo redirectionInfo = authenticationHandler(
           exchangeCharset,
           clientCapabilities,
           greetingPacket.getPluginName(),
@@ -393,7 +438,10 @@ public abstract class AbstractConnectProtocol implements Protocol {
           username,
           password,
           host);
-
+      if (redirectionInfo != null && permitRedirection) {
+        closeSocket();
+        return redirectionInfo;
+      }
       compressionHandler(options);
     } catch (IOException ioException) {
       closeSocket();
@@ -427,6 +475,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
     activeStreamingResult = null;
     hostFailed = false;
+    return null;
   }
 
   private static Socket createSocket(final String host, final int port, final Options options) throws SQLException {
@@ -544,11 +593,11 @@ public abstract class AbstractConnectProtocol implements Protocol {
     }
   }
 
-  private void authenticationHandler(byte exchangeCharset, long clientCapabilities,
-                                     String pluginName, byte[] seed,
-                                     Options options,
-                                     String database, String username, String password,
-                                     String host)
+  private RedirectionInfo authenticationHandler(byte exchangeCharset, long clientCapabilities,
+                                            String pluginName, byte[] seed,
+                                            Options options,
+                                            String database, String username, String password,
+                                            String host)
       throws SQLException, IOException {
 
     //send Client Handshake Response
@@ -635,6 +684,10 @@ public abstract class AbstractConnectProtocol implements Protocol {
            *********************************************************************/
           OkPacket okPacket = new OkPacket(buffer);
           serverStatus = okPacket.getServerStatus();
+          if (options.enableRedirect && !okPacket.getMessage().isEmpty()) {
+            return RedirectionInfo.parseRedirectionInfo(okPacket.getMessage());
+          }
+
           break authentication_loop;
 
         default:
@@ -643,6 +696,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
       }
     }
     writer.permitTrace(true);
+    return null;
   }
 
   private void compressionHandler(Options options) {
@@ -1165,7 +1219,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
     //CONJ-293 : handle name-pipe without host
     if (hosts.isEmpty() && options.pipe != null) {
       try {
-        createConnection(null, 0, username);
+        connectWithPossibleRedirection(null, 0, username);
         return;
       } catch (SQLException exception) {
         throw ExceptionMapper.connException(
@@ -1180,7 +1234,7 @@ public abstract class AbstractConnectProtocol implements Protocol {
     while (!hosts.isEmpty()) {
       currentHost = hosts.poll();
       try {
-        createConnection(currentHost.host, currentHost.port, username);
+        connectWithPossibleRedirection(currentHost.host, currentHost.port, username);
         return;
       } catch (SQLException e) {
         if (hosts.isEmpty()) {

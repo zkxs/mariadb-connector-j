@@ -52,12 +52,15 @@
 
 package org.mariadb.jdbc.internal.com.read;
 
+import java.nio.charset.StandardCharsets;
+
 public class OkPacket {
 
   private final long affectedRows;
   private final long insertId;
   private final short serverStatus;
   private final short warnings;
+  private final String message;
 
   /**
    * Read Ok stream result.
@@ -70,6 +73,11 @@ public class OkPacket {
     insertId = buffer.getLengthEncodedNumeric();
     serverStatus = buffer.readShort();
     warnings = buffer.readShort();
+    if (buffer.remaining() > 0) {
+        message = buffer.readStringLengthEncoded(StandardCharsets.UTF_8);
+    } else {
+        message = "";
+    }
   }
 
   @Override
@@ -81,7 +89,9 @@ public class OkPacket {
         + "&serverStatus="
         + serverStatus
         + "&warnings="
-        + warnings;
+        + warnings
+        + "&message="
+        + message;
   }
 
   public long getAffectedRows() {
@@ -100,4 +110,7 @@ public class OkPacket {
     return warnings;
   }
 
+  public String getMessage() {
+      return message;
+  }
 }
