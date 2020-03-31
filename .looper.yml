@@ -1,0 +1,108 @@
+tools:
+  jdk:
+    - 1.8
+  maven:
+    - 3.3.9
+  sonarscanner:
+    - 3.0.3.778
+triggers:
+  - manual:
+      name: Publish Snapshot
+      call: default
+  - manual:
+      name: Publish Release
+      call: release
+flows:
+  default:
+    try:
+      - call: show-environment-details
+      - call: test
+      - call: publish-snapshot
+      - call: sonar-build
+    finally:
+      - hygieia.publishBuild()
+      - call: publish-tests
+      - call: publish-artifact
+  release:
+    try:
+      - call: show-environment-details
+      - call: test
+      - call: publish-release
+      - call: sonar-build
+    finally:
+      - hygieia.publishBuild()
+      - call: publish-tests
+      - call: publish-artifact
+  pr:
+    - call: show-environment-details
+    - call: test
+  test:
+    - mvn clean test
+  show-environment-details:
+    - |
+      (name show-environment-details)
+      #!/bin/bash
+      echo "kernel version is: $(uname -a)"
+      echo "OS is: $(cat /etc/issue)"
+      echo "bash version is: $BASH_VERSION"
+  publish-snapshot:
+    - exposeVars(maven)
+    - |
+      (name publish-snapshot)
+      #/bin/bash
+      mvn versions:set -DnewVersion=${MAVEN_VERSION}-SNAPSHOT
+      mvn clean deploy
+  publish-release:
+    - exposeVars(maven)
+    - |
+      (name publish-release)
+      #!/bin/bash
+      branch=$(git rev-parse --abbrev-ref HEAD)
+      major=$(echo "$MAVEN_VERSION" | awk -F '.' '{print $1}')
+      minor=$(echo "$MAVEN_VERSION" | awk -F '.' '{print $2}')
+      patch=$(echo "$MAVEN_VERSION" | awk -F '.' '{print $3}')
+      ((patch++))
+      PATCHED="$major.$minor.$patch"
+      echo "if we patch, the new version will be $PATCHED"
+      echo "code version is set to $MAVEN_VERSION"
+      groupid="$(echo "$MAVEN_GROUP_ID" | sed 's#\.#/#g')" # replace all those '.'s with '/'s
+      latest="$(wget -O - -q https://repository.walmart.com/content/repositories/pangaea_releases/${groupid}/${MAVEN_ARTIFACT_ID}/maven-metadata.xml | grep -Po '(?<=<version>)([0-9\.]+(-SNAPSHOT)?)' | sort --version-sort -r | head -n 1)"
+      echo "latest version in proximity is $latest"
+      function version_gt() { test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"; }
+      if [ "$latest" == "$MAVEN_VERSION" ]; then
+        echo "$MAVEN_ARTIFACT_ID $MAVEN_VERSION already deployed to proximity"
+        env
+        exit 1
+      elif version_gt $MAVEN_VERSION $latest || [ "$latest" == "" ]; then
+        echo "deploying $MAVEN_ARTIFACT_ID $MAVEN_VERSION to proximity"
+        mvn clean deploy
+        git tag "$MAVEN_VERSION"
+        git push origin "$MAVEN_VERSION"
+        echo "patch version bump is set to $PATCHED"
+        git pull origin "$branch"
+        mvn versions:set -DnewVersion=${PATCHED}
+        git add pom.xml
+        git commit -m "${PATCHED}"
+        git push origin "$branch"
+        mvn versions:set -DnewVersion=${MAVEN_VERSION}
+      else
+        echo "Oops, maven $latest is ahead of master $MAVEN_VERSION"
+        env
+        exit 1
+      fi
+  sonar-build:
+    - sonar("Sonar"): sonar-scanner -Dproject.settings=sonar-project.properties
+    - hygieia.publishSonar()
+  publish-tests:
+    - hygieia.publishTest(
+      testRunner = 'JUnit',
+      testResultsDirectory = '../target/surefire-reports/junitreports',
+      testFileNamePattern = '*Test.java',
+      testApplicationName = 'shelf-shaed-library', testEnvironmentName = 'dev')
+  publish-artifact:
+    - hygieia.publishArtifact(
+      artifactDirectory = "./",
+      artifactType = 'maven',
+      artifactNamePattern = '*.jar',
+      artifactGroup='com.walmart',
+      excludeDirectories = 'target/checkout')
